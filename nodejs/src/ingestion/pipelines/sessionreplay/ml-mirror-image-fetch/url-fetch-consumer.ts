@@ -13,6 +13,7 @@ import {
     FetchCandidate,
     MAX_HOPS,
     UrlDropReason,
+    UrlRefFilter,
     UrlSkipReason,
     parseCollectedUrlsRecord,
 } from './collected-urls-record'
@@ -29,6 +30,7 @@ import {
 } from './fetch-runner'
 import { FrontierDeadLetterReason, FrontierDeadLetterSink } from './frontier-dead-letter-sink'
 import { FrontierPublisher, RepublishBatch } from './frontier-publisher'
+import type { RefreshingImageSink } from './image-sink'
 import { ImageFetchConsumerMetrics, ImageFetchRequestMetrics } from './metrics'
 import { ImageFetchProcessingMetrics } from './processing-metrics'
 import { ImageFetchTopHogMetrics } from './tophog-metrics'
@@ -47,6 +49,12 @@ type RejectedFrontierRecord = {
 export interface UrlFetchConsumerOptions {
     seenTtlSeconds: number
     dryRun: boolean
+    /** The references this lane fetches. The default is the v3 lane's. */
+    acceptsRef?: UrlRefFilter
+    /** Drops jobs before any request for them, and resolves to the jobs that stay. The lane counts what it drops. */
+    admitCandidates?: (candidates: FetchCandidate[], nowMs: number) => Promise<FetchCandidate[]>
+    /** The lane's sink when it keeps each image alive in place. A job not due for a fetch then refreshes a stale image. */
+    refreshingSink?: RefreshingImageSink
 }
 
 export class UrlFetchConsumer {
@@ -162,8 +170,12 @@ export class UrlFetchConsumer {
                     }
                 }
             }
-            const candidates = [...candidatesByRef.values()]
+            const parsedCandidates = [...candidatesByRef.values()]
             candidatesByRef.clear()
+            const candidates =
+                this.options.admitCandidates && !this.options.dryRun && parsedCandidates.length > 0
+                    ? await this.options.admitCandidates(parsedCandidates, nowMs)
+                    : parsedCandidates
             const origins = new Map<string, number>()
             const registrableDomains = new Map<string, number>()
             const partitionOrigins = new Map<number, Map<string, number>>()
@@ -213,9 +225,14 @@ export class UrlFetchConsumer {
             stage.move('batch_filter')
             const fetchable: FetchCandidate[] = []
             const notReady: FetchCandidate[] = []
+            const refreshDue: { candidate: FetchCandidate; history: UrlCrawlHistoryItem }[] = []
             for (const candidate of candidates) {
                 const history = stored.get(candidate.originalRef)
                 if (history?.kind === 'url' && history.nextFetchAtMs > nowMs) {
+                    if (this.isRefreshDue(history, nowMs)) {
+                        refreshDue.push({ candidate, history })
+                        continue
+                    }
                     ImageFetchConsumerMetrics.incDeduped('store', 1)
                     for (const sourcePartition of candidate.sourcePartitions ?? []) {
                         ImageFetchConsumerMetrics.incPartitionUrls(sourcePartition, 'store_deduped', 1)
@@ -236,6 +253,13 @@ export class UrlFetchConsumer {
             }
             ImageFetchConsumerMetrics.incFetchable(fetchable.length)
 
+            const refreshed = await Promise.all(
+                refreshDue.map(async ({ candidate, history }) => ({
+                    ...history,
+                    storedAtMs: (await this.options.refreshingSink!.refreshImage(candidate)) ? nowMs : undefined,
+                }))
+            )
+
             const republishBatch = this.publisher.createRepublishBatch(republishDeadlineAtMonotonicMs)
             stage.move('batch_fetch')
             const attempts = await this.runner!.run(fetchable, stored, republishBatch, admission)
@@ -245,7 +269,7 @@ export class UrlFetchConsumer {
                     notReady.map((candidate) => this.republishNotReady(republishBatch, candidate, nowMs))
                 ))
             )
-            const updates: CrawlHistoryItem[] = []
+            const updates: CrawlHistoryItem[] = [...refreshed]
             for (const attempt of attempts) {
                 updates.push(...attempt.configurationUpdates)
                 if (attempt.history) {
@@ -299,7 +323,7 @@ export class UrlFetchConsumer {
 
     private parse(message: Message): ReturnType<typeof parseCollectedUrlsRecord> {
         try {
-            return parseCollectedUrlsRecord(message.value, message.key?.toString() ?? null)
+            return parseCollectedUrlsRecord(message.value, message.key?.toString() ?? null, this.options.acceptsRef)
         } catch (error) {
             logger.error('🌐', 'ml_image_fetch_record_parse_threw', {
                 error: error instanceof Error ? error.name : 'unknown',
@@ -416,6 +440,11 @@ export class UrlFetchConsumer {
                 Number(process.hrtime.bigint() - startedAt) / 1e9
             )
         }
+    }
+
+    private isRefreshDue(history: UrlCrawlHistoryItem, nowMs: number): boolean {
+        const sink = this.options.refreshingSink
+        return !!sink && history.storedAtMs !== undefined && nowMs - history.storedAtMs >= sink.refreshIntervalMs
     }
 
     private async republishNotReady(
