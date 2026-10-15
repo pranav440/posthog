@@ -8,3 +8,17 @@ import type { ImageFetchResult } from './image-fetcher'
 export interface FetchedImageSink {
     publishImage(candidate: FetchCandidate, result: ImageFetchResult): Promise<void>
 }
+
+/**
+ * A sink that keeps each stored image alive in place. S3 expires an object by its creation time, so the lane refreshes
+ * an image that went `refreshIntervalMs` without one, and the image lives as long as the data that references it.
+ */
+export interface RefreshingImageSink extends FetchedImageSink {
+    readonly refreshIntervalMs: number
+    /** Resets the age of the stored image of a reference, with no origin request. Resolves to false if none is stored. */
+    refreshImage(candidate: FetchCandidate): Promise<boolean>
+}
+
+export function isRefreshingImageSink(sink: FetchedImageSink): sink is RefreshingImageSink {
+    return 'refreshImage' in sink
+}
