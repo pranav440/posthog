@@ -87,7 +87,8 @@ function isCrawlHistoryItem(value: unknown, expectedKey: string): value is Crawl
         return (
             isFiniteNumber(value.nextFetchAtMs) &&
             typeof value.outcome === 'string' &&
-            (value.cache === undefined || isHttpCacheMetadata(value.cache))
+            (value.cache === undefined || isHttpCacheMetadata(value.cache)) &&
+            (value.storedAtMs === undefined || isFiniteNumber(value.storedAtMs))
         )
     }
     return (

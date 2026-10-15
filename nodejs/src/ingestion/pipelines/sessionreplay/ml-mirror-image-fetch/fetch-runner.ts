@@ -21,13 +21,13 @@ import {
     RequestScheduleBlockReason,
     TransientFetchOutcome,
 } from './image-fetcher'
-import type { FetchedImageSink } from './image-sink'
+import { FetchedImageSink, isRefreshingImageSink } from './image-sink'
 import { ImageFetchPoolMetrics, ImageFetchRequestMetrics } from './metrics'
 import { OriginRequestScheduler } from './origin-request-scheduler'
 import { canonicalizeUrl } from './politeness-key'
 import { ImageFetchProcessingMetrics } from './processing-metrics'
 import { ImageFetchTopHogMetrics } from './tophog-metrics'
-import { storedUrlHistoryCache, urlHistoryExpiresAtMs } from './url-history-expiry'
+import { storedUrlHistoryCache, urlHistoryExpiresAtMs, urlHistoryStorageExpiresAtMs } from './url-history-expiry'
 
 export type ShedReason =
     | 'breaker_open'
@@ -713,10 +713,19 @@ export class FetchRunner implements FetchPass {
                 configurationUpdates
             )
         }
-        if (result.outcome === 'ok') {
+        const refreshingSink = isRefreshingImageSink(this.imageSink) ? this.imageSink : undefined
+        let storedAtMs: number | undefined
+        if (result.outcome === 'ok' || (result.outcome === 'not_modified' && refreshingSink)) {
             releaseRegistrableDomainSlot()
             try {
-                await this.imageSink.publishImage(attemptedCandidate, result)
+                let stored = true
+                if (result.outcome === 'ok') {
+                    await this.imageSink.publishImage(attemptedCandidate, result)
+                } else {
+                    // A 304 says the stored image is current, so a sink that keeps images alive refreshes it in place.
+                    stored = await refreshingSink!.refreshImage(attemptedCandidate)
+                }
+                storedAtMs = refreshingSink && stored ? Date.now() : undefined
             } catch {
                 return {
                     candidate: attemptedCandidate,
@@ -735,7 +744,8 @@ export class FetchRunner implements FetchPass {
             result.outcome,
             mergedCache,
             configurationUpdates,
-            result.refusalReason
+            result.refusalReason,
+            storedAtMs
         )
     }
 
@@ -801,7 +811,8 @@ export class FetchRunner implements FetchPass {
         outcome: AttemptOutcome,
         cache: HttpCacheMetadata | undefined,
         configurationUpdates: ConfigurationCacheItem[],
-        refusalReason: FetchRefusalReason | 'none' = 'none'
+        refusalReason: FetchRefusalReason | 'none' = 'none',
+        storedAtMs?: number
     ): FetchAttempt {
         const nowMs = Date.now()
         const nextFetchAtMs = urlHistoryExpiresAtMs(candidate.originalRef, nowMs, this.options.seenTtlSeconds, cache)
@@ -822,9 +833,10 @@ export class FetchRunner implements FetchPass {
                 kind: 'url',
                 key: candidate.originalRef,
                 nextFetchAtMs,
-                storageExpiresAtMs: nextFetchAtMs,
+                storageExpiresAtMs: urlHistoryStorageExpiresAtMs(candidate.originalRef, nextFetchAtMs),
                 outcome: String(outcome),
                 cache: storedUrlHistoryCache(candidate.originalRef, cache),
+                ...(storedAtMs === undefined ? {} : { storedAtMs }),
             },
             configurationUpdates,
         }

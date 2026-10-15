@@ -32,7 +32,7 @@ import { FrontierPublisher, RepublishBatch } from './frontier-publisher'
 import { ImageFetchConsumerMetrics, ImageFetchRequestMetrics } from './metrics'
 import { ImageFetchProcessingMetrics } from './processing-metrics'
 import { ImageFetchTopHogMetrics } from './tophog-metrics'
-import { urlHistoryExpiresAtMs } from './url-history-expiry'
+import { urlHistoryExpiresAtMs, urlHistoryStorageExpiresAtMs } from './url-history-expiry'
 
 const ONE_HOUR_MS = 60 * 60 * 1000
 const REPUBLISH_DEADLINE_FROM_BATCH_START_MS = 200_000
@@ -478,7 +478,7 @@ export class UrlFetchConsumer {
             kind: 'url',
             key: candidate.originalRef,
             nextFetchAtMs,
-            storageExpiresAtMs: nextFetchAtMs,
+            storageExpiresAtMs: urlHistoryStorageExpiresAtMs(candidate.originalRef, nextFetchAtMs),
             outcome,
         }
     }

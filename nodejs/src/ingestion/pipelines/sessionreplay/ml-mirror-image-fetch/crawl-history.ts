@@ -16,6 +16,8 @@ export interface UrlCrawlHistoryItem {
     storageExpiresAtMs: number
     outcome: string
     cache?: HttpCacheMetadata
+    /** When a lane that keeps each image alive in place last stored or refreshed the image of this reference. */
+    storedAtMs?: number
 }
 
 export type ConfigurationFile = 'robots' | 'tdmrep'
