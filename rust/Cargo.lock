@@ -10964,6 +10964,7 @@ dependencies = [
  "envconfig",
  "lifecycle",
  "metrics",
+ "moka",
  "parquet",
  "posthog-replay-anonymizer",
  "rand 0.8.5",
@@ -10975,6 +10976,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

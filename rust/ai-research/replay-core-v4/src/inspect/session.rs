@@ -47,21 +47,52 @@ pub struct SessionInspector {
 pub struct BlockInspection {
     counter: EventCounter,
     moments: Vec<Moment>,
+    image_urls: Vec<String>,
     events: u32,
 }
 
+/// What the inspector learned about one block.
+pub struct Inspected {
+    pub stats: BlockStats,
+    pub moments: Vec<Moment>,
+    /// Remote image URLs the block's DOM referenced, for the image fetcher.
+    pub image_urls: Vec<String>,
+}
+
 impl BlockInspection {
-    pub fn finish(self) -> (BlockStats, Vec<Moment>) {
-        (self.counter.finish(), self.moments)
+    pub fn finish(self) -> Inspected {
+        Inspected {
+            stats: self.counter.finish(),
+            moments: self.moments,
+            image_urls: self.image_urls,
+        }
     }
 }
 
 impl SessionInspector {
+    /// Drops what the session learned about its DOM and keeps its activity, clicks and page: its blocks are cold
+    /// starts until a full snapshot, and each window's mutations go unchecked until that window's next snapshot.
+    pub fn evict_dom(&mut self) {
+        self.dom = DomInspector::after_eviction();
+        self.decided = true;
+        self.cold = true;
+        self.undecided = 0;
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.dom.retained_bytes()
+            + self.activity.retained_bytes()
+            + self.last_href.as_ref().map_or(0, String::capacity)
+    }
+
     pub fn observe_message(&mut self, block: &mut BlockInspection, message: &Message) {
+        self.dom.start_message();
         let window = message.window_id.clone().unwrap_or_default();
         for event in &message.events {
             self.observe(block, &message.inner, event, &window);
         }
+        self.dom.finish_message();
     }
 
     fn observe(
@@ -96,10 +127,11 @@ impl SessionInspector {
         let navigated = block.counter.stats.navigations > navigations;
 
         let waiting = block.counter.stats.events_before_first_full_snapshot;
-        let changed = self
+        let observed = self
             .dom
             .observe(inner, event, window, &mut block.counter.stats);
-        if event.kind == Some(FULL_SNAPSHOT) {
+        block.image_urls.extend(self.dom.take_image_urls());
+        if observed.full_snapshot {
             self.cold = false;
         }
         let stats = &mut block.counter.stats;
@@ -122,7 +154,7 @@ impl SessionInspector {
             Some(FULL_SNAPSHOT) => Some("full_snapshot"),
             Some(META | CUSTOM) if navigated => Some("navigation"),
             Some(INCREMENTAL_SNAPSHOT)
-                if event.source == Some(MUTATION) && changed >= LARGE_DOM_CHANGE_NODES =>
+                if event.source == Some(MUTATION) && observed.changed >= LARGE_DOM_CHANGE_NODES =>
             {
                 Some("dom_change")
             }
@@ -176,7 +208,8 @@ mod tests {
     fn inspect(session: &mut SessionInspector, message: &Message) -> (BlockStats, Vec<Moment>) {
         let mut block = BlockInspection::default();
         session.observe_message(&mut block, message);
-        block.finish()
+        let inspected = block.finish();
+        (inspected.stats, inspected.moments)
     }
 
     fn big_mutation(ts: i64) -> Value {
@@ -307,8 +340,10 @@ mod tests {
             big_mutation(1),
             {"type": 3, "timestamp": 2, "data": {"source": 1, "positions": []}},
         ]));
-        let (stats, _) = inspect(&mut SessionInspector::default(), &mid_session);
+        let (stats, moments) = inspect(&mut SessionInspector::default(), &mid_session);
         assert!(stats.cold_start);
+        let kinds: Vec<_> = moments.iter().map(|m| (m.kind, m.event_index)).collect();
+        assert_eq!(kinds, [("dom_change", 0)]);
         // Nothing here says the session cannot play: its snapshot came before this process saw it.
         assert_eq!(
             (

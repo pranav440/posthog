@@ -411,6 +411,7 @@ mod tests {
             messages: vec![message],
             stats: BlockStats::default(),
             moments: Vec::new(),
+            image_urls: Vec::new(),
         }
     }
 
