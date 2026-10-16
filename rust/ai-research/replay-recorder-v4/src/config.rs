@@ -98,6 +98,11 @@ pub struct Config {
     #[envconfig(default = "3600")]
     pub session_idle_secs: u64,
 
+    /// The inspector state all sessions keep between flushes. Past it the sessions seen least recently lose their DOM
+    /// state. It only stops runaway growth, such as many huge pages at once, so keep it well above normal use.
+    #[envconfig(default = "4294967296")]
+    pub session_state_max_bytes: usize,
+
     /// Off, the recorder reads, admits and inspects, and stores nothing: no keys, no objects.
     #[envconfig(from = "SESSION_RECORDING_ML_V4_WRITE_ENABLED", default = "false")]
     pub write_enabled: bool,
