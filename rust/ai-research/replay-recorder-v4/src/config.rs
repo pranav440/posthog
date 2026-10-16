@@ -9,6 +9,11 @@ pub struct Config {
     #[envconfig(default = "session_recording_snapshot_item_events")]
     pub kafka_topic: String,
 
+    /// The main replay lane's overflow mode. With `redirect`, that lane moves force-overflow messages of the main topic
+    /// to the overflow topic, so v4 records them there and not twice.
+    #[envconfig(from = "INGESTION_OVERFLOW_MODE", default = "disabled")]
+    pub ingestion_overflow_mode: String,
+
     #[envconfig(default = "session-replay-recorder-v4")]
     pub kafka_consumer_group: String,
 
@@ -22,6 +27,37 @@ pub struct Config {
 
     /// The Postgres database the team list is read from. A read replica is enough.
     pub database_url: String,
+
+    /// The Redis the event ingestion restrictions are read from, as capture and the replay lanes read them.
+    pub event_restrictions_redis_url: String,
+
+    #[envconfig(default = "30")]
+    pub event_restrictions_refresh_secs: u64,
+
+    /// The session recording Redis. v4's new-session rate limiter keeps its seen and blocked sessions there, under its
+    /// own keys.
+    pub session_recording_redis_url: String,
+
+    /// The new-session rate limiter's bucket per team, as in the main lane: this many new sessions at once, and this
+    /// many more each second, scaled by the sample. See [`Config::new_session_bucket`].
+    #[envconfig(
+        from = "SESSION_RECORDING_ML_V4_NEW_SESSION_BUCKET_CAPACITY",
+        default = "3000"
+    )]
+    pub new_session_bucket_capacity: f64,
+
+    #[envconfig(
+        from = "SESSION_RECORDING_ML_V4_NEW_SESSION_BUCKET_REPLENISH_RATE",
+        default = "300"
+    )]
+    pub new_session_bucket_replenish_rate: f64,
+
+    /// Off, the limiter only counts the sessions it would block.
+    #[envconfig(
+        from = "SESSION_RECORDING_ML_V4_NEW_SESSION_BLOCKING_ENABLED",
+        default = "true"
+    )]
+    pub new_session_blocking_enabled: bool,
 
     /// How often the team list refreshes. Consent changes take effect within this time, as in v3.
     #[envconfig(default = "300")]
@@ -60,6 +96,86 @@ pub struct Config {
     #[envconfig(default = "session_replay_image_fetch_v4")]
     pub image_fetch_topic: String,
 
+    /// A fetch job not delivered in this time fails its flush.
+    #[envconfig(default = "20000")]
+    pub image_fetch_delivery_timeout_ms: u32,
+
     #[envconfig(default = "9104")]
     pub metrics_port: u16,
+}
+
+/// The slowest refill of a scaled new-session bucket: one session each 100 seconds.
+const MIN_NEW_SESSION_REPLENISH_RATE: f64 = 0.01;
+
+impl Config {
+    /// The bucket v4 runs, as `(capacity, replenish rate per second)`. v4 sees only its sample of the sessions, so both
+    /// scale by the sample, and a flood trips v4 at about the rate that trips the main lane.
+    pub fn new_session_bucket(&self) -> (f64, f64) {
+        let share = self.sample_percentage / 100.0;
+        let scaled = |value: f64, floor: f64| {
+            if value > 0.0 {
+                (value * share).max(floor)
+            } else {
+                value
+            }
+        };
+        (
+            scaled(self.new_session_bucket_capacity, 1.0),
+            scaled(
+                self.new_session_bucket_replenish_rate,
+                MIN_NEW_SESSION_REPLENISH_RATE,
+            ),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn config(vars: &[(&str, &str)]) -> Config {
+        let mut env: HashMap<String, String> = HashMap::from([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://localhost/posthog".to_owned(),
+            ),
+            (
+                "EVENT_RESTRICTIONS_REDIS_URL".to_owned(),
+                "redis://localhost:6379/".to_owned(),
+            ),
+            (
+                "SESSION_RECORDING_REDIS_URL".to_owned(),
+                "redis://localhost:6379/".to_owned(),
+            ),
+        ]);
+        env.extend(vars.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+        Config::init_from_hashmap(&env).unwrap()
+    }
+
+    #[test]
+    fn scales_the_new_session_bucket_by_the_sample() {
+        let bucket = |sample: &str, capacity: &str, rate: &str| {
+            config(&[
+                ("SESSION_RECORDING_ML_V4_SAMPLE_PERCENTAGE", sample),
+                (
+                    "SESSION_RECORDING_ML_V4_NEW_SESSION_BUCKET_CAPACITY",
+                    capacity,
+                ),
+                (
+                    "SESSION_RECORDING_ML_V4_NEW_SESSION_BUCKET_REPLENISH_RATE",
+                    rate,
+                ),
+            ])
+            .new_session_bucket()
+        };
+        assert_eq!(bucket("100", "3000", "300"), (3000.0, 300.0));
+        assert_eq!(bucket("10", "3000", "300"), (300.0, 30.0));
+        assert_eq!(
+            bucket("0.01", "3000", "30"),
+            (1.0, MIN_NEW_SESSION_REPLENISH_RATE)
+        );
+        assert_eq!(bucket("10", "0", "0"), (0.0, 0.0));
+    }
 }
