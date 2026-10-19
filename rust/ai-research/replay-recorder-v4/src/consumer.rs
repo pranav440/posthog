@@ -19,7 +19,7 @@ use rdkafka::{ClientConfig, ClientContext, Offset, TopicPartitionList};
 
 use crate::batch::{Batch, Block, Inspectors, Raw, SessionKey, Tp};
 use crate::config::{retry_backoff, FLUSH_DEADLINE, MAX_POLL_INTERVAL};
-use crate::flush::{write_flush, Writer};
+use crate::flush::{write_flush, Writer, PRODUCER_FLUSH_ON_SHUTDOWN};
 use crate::limits::{Restrictions, SessionLimiter};
 use crate::process::{admit, sampled, Admitted, Headers, Skip};
 use crate::teams::TeamCache;
@@ -420,6 +420,20 @@ pub async fn run(
     writer: Option<Writer>,
     handle: Handle,
 ) {
+    consume(&consumer, &settings, &sources, writer.as_ref(), &handle).await;
+    // The flushes do not wait for their index rows, so the producer can still hold some.
+    if let Some(writer) = &writer {
+        writer.flush_producers(PRODUCER_FLUSH_ON_SHUTDOWN).await;
+    }
+}
+
+async fn consume(
+    consumer: &RecorderConsumer,
+    settings: &Settings,
+    sources: &Sources,
+    writer: Option<&Writer>,
+    handle: &Handle,
+) {
     let shutdown = handle.shutdown_signal();
     tokio::pin!(shutdown);
     let mut batch = Batch::default();
@@ -444,16 +458,16 @@ pub async fn run(
                             None => break,
                         }
                     }
-                    handle_messages(&messages, &consumer, &settings, &sources, &mut batch).await;
+                    handle_messages(&messages, consumer, settings, sources, &mut batch).await;
                     drop(messages);
                     if let Some(error) = failed {
-                        if receive_failed(&consumer, &handle, error) {
+                        if receive_failed(consumer, handle, error) {
                             return;
                         }
                     }
                 }
                 Err(error) => {
-                    if receive_failed(&consumer, &handle, error) {
+                    if receive_failed(consumer, handle, error) {
                         return;
                     }
                 }
@@ -469,10 +483,10 @@ pub async fn run(
             let work = flush(
                 std::mem::take(&mut batch),
                 &mut inspectors,
-                &consumer,
-                &settings,
-                writer.as_ref(),
-                &handle,
+                consumer,
+                settings,
+                writer,
+                handle,
                 settings.flush_retries,
             );
             tokio::pin!(work);
@@ -500,10 +514,10 @@ pub async fn run(
         flush(
             batch,
             &mut inspectors,
-            &consumer,
-            &settings,
-            writer.as_ref(),
-            &handle,
+            consumer,
+            settings,
+            writer,
+            handle,
             0,
         ),
     )
@@ -587,6 +601,7 @@ async fn handle_messages(
                 counter!("replay_recorder_v4_messages_total", "outcome" => "admitted").increment(1);
                 let raw = Raw {
                     offset: message.offset(),
+                    captured_at_ms: message.timestamp().to_millis(),
                     payload: message.payload().unwrap_or_default().to_vec(),
                     content_encoding: header(message, "content-encoding").map(str::to_owned),
                 };
@@ -821,6 +836,7 @@ mod tests {
                 stats: BlockStats::default(),
                 moments: Vec::new(),
                 image_urls: Vec::new(),
+                captured_at_ms: None,
             })
         };
         let offsets = HashMap::from([(tp(0), (1, 5)), (tp(1), (1, 5)), (tp(2), (1, 5))]);

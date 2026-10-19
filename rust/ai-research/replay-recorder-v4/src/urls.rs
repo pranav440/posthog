@@ -159,6 +159,7 @@ mod tests {
             stats: BlockStats::default(),
             moments: Vec::new(),
             image_urls: urls.iter().map(|u| (*u).to_owned()).collect(),
+            captured_at_ms: None,
         };
         let mut stats = BlockStats::default();
         let mut keys = FlushKeys::default();

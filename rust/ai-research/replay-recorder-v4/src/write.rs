@@ -1,7 +1,7 @@
-//! Writes a flush: image packs and their index first, then one object of sealed session blocks, then their index.
+//! Writes a flush: image packs first, then one object of sealed session blocks, and builds the index rows for both.
 //!
 //! The order matters for a crash between writes. A pack without its blocks is unreferenced, which is harmless. A block
-//! whose images were never stored would hold references that resolve to nothing.
+//! whose images were never stored would hold references that resolve to nothing. The rows go out only after both.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
@@ -15,7 +15,6 @@ use replay_core_v4::envelope::{seal_frame, seal_json_envelope, Codec, Context, V
 use replay_core_v4::inspect::events::event_page_url;
 use replay_core_v4::inspect::stats::BlockStats;
 use replay_core_v4::keys::batch::{FlushKeys, SessionId, SessionKey as Key};
-use replay_core_v4::keys::rows::write_day;
 use replay_core_v4::scan::cv::extract_event_images;
 use replay_core_v4::scan::images::{Image, ImageLimits, ImageSink};
 use replay_core_v4::seal::image_content_key;
@@ -23,9 +22,7 @@ use replay_core_v4::seal::image_content_key;
 use tokio::sync::Semaphore;
 
 use crate::batch::{Block, SessionKey};
-use crate::index::{
-    block_index, image_index, write_parquet, BlockIndexRow, ImageIndexRow, IndexError,
-};
+use crate::index::{BlockIndexRow, ImageIndexRow};
 use crate::store::{BlobStore, StoreError};
 
 /// Brotli settings for blocks, the same as the v3 lane. The lane keeps blocks for months and reads them rarely, so it
@@ -40,8 +37,6 @@ const BLOCK_WRITE_BUFFER: usize = 256 * 1024;
 pub enum WriteError {
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error(transparent)]
-    Index(#[from] IndexError),
     #[error("sealing failed: {0}")]
     Seal(String),
 }
@@ -244,8 +239,8 @@ fn seal_pack(
     Ok((pack, rows))
 }
 
-/// Seals each team's images under its team month key into one pack, stores the packs concurrently, then writes the
-/// image index for the flush.
+/// Seals each team's images under its team month key into one pack and stores the packs concurrently. Returns the
+/// image index rows of the stored packs.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_images(
     images: BTreeMap<i64, Vec<Image>>,
@@ -253,7 +248,6 @@ pub async fn write_images(
     write_day: &str,
     key_month: &str,
     images_bucket: &str,
-    rrweb_bucket: &str,
     store: &Arc<dyn BlobStore>,
     at: DateTime<Utc>,
     concurrency: usize,
@@ -280,20 +274,13 @@ pub async fn write_images(
             })
         })
         .collect();
-    let rows: Vec<ImageIndexRow> = stream::iter(packs)
+    Ok(stream::iter(packs)
         .buffer_unordered(concurrency.max(1))
         .try_collect::<Vec<_>>()
         .await?
         .into_iter()
         .flatten()
-        .collect();
-    if !rows.is_empty() {
-        let index_key = format!("index/images/dt={write_day}/{}.parquet", unique_suffix(at));
-        let batch = image_index(&rows)?;
-        let file = blocking(move || write_parquet(&batch).map_err(WriteError::from)).await?;
-        store.put_new(rrweb_bucket, &index_key, file).await?;
-    }
-    Ok(rows)
+        .collect())
 }
 
 /// Writes the flush's sealed blocks as one object. Returns where each landed, in the same order.
@@ -381,16 +368,13 @@ impl FlushAttempt {
     }
 }
 
-/// Writes one block index file for the flush, after its blocks, so no row points at a block that is not stored.
+/// The flush's block index rows, built after its blocks are stored, so no row points at a block that is not.
 /// Each entry is a block, its stats as this attempt filled them, and where it landed.
-pub async fn write_block_index(
-    entries: &[(&Block, &BlockStats, &Written)],
+pub fn block_index_rows<'a>(
+    entries: &[(&'a Block, &'a BlockStats, &'a Written)],
     keys: &FlushKeys,
-    attempt: &FlushAttempt,
-    rrweb_bucket: &str,
-    store: &dyn BlobStore,
-    at: DateTime<Utc>,
-) -> Result<usize, WriteError> {
+    attempt: &'a FlushAttempt,
+) -> Result<Vec<BlockIndexRow<'a>>, WriteError> {
     let mut rows = Vec::with_capacity(entries.len());
     for &(block, stats, written) in entries {
         let id = SessionId {
@@ -421,29 +405,27 @@ pub async fn write_block_index(
         };
         let first = block.messages.first();
         rows.push(BlockIndexRow {
-            written,
-            origin: &block.origin,
-            attempt,
+            team_id: written.session.team_id,
+            session_id: &written.session.session_id,
+            key_month: &written.key_month,
+            block_s3_key: &written.object_key,
+            topic: block.origin.tp.topic,
+            partition: block.origin.tp.partition,
+            start_offset: block.origin.start_offset,
+            end_offset: block.origin.end_offset,
+            flush_id: &attempt.flush_id,
+            flushed_at_ms: attempt.flushed_at_ms,
+            block_byte_start: written.byte_start,
+            block_byte_end: written.byte_end,
             stats,
-            moments: &block.moments,
             snapshot_source: first.and_then(|m| m.snapshot_source.as_deref()),
             snapshot_library: first.and_then(|m| m.library.as_deref()),
+            moments: &block.moments,
             urls,
+            captured_at_ms: block.captured_at_ms,
         });
     }
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let index_key = format!(
-        "index/blocks/dt={}/{}.parquet",
-        write_day(at),
-        unique_suffix(at)
-    );
-    let count = rows.len();
-    let batch = block_index(&rows)?;
-    let file = blocking(move || write_parquet(&batch).map_err(WriteError::from)).await?;
-    store.put_new(rrweb_bucket, &index_key, file).await?;
-    Ok(count)
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -454,13 +436,9 @@ mod tests {
 
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
-    use arrow_array::{Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray};
-    use arrow_schema::DataType;
     use async_trait::async_trait;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    use bytes::Bytes;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use replay_core_v4::envelope::open_frame;
     use replay_core_v4::inspect::session::Moment;
     use replay_core_v4::scan::message::read_message;
@@ -477,29 +455,6 @@ mod tests {
     impl MemoryStore {
         fn get(&self, bucket: &str, key: &str) -> Vec<u8> {
             self.objects.lock().unwrap()[&(bucket.to_owned(), key.to_owned())].clone()
-        }
-
-        fn keys(&self, prefix: &str) -> Vec<String> {
-            let mut keys: Vec<String> = self
-                .objects
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|(_, key)| key.starts_with(prefix))
-                .map(|(_, key)| key.clone())
-                .collect();
-            keys.sort();
-            keys
-        }
-
-        fn parquet(&self, key: &str) -> RecordBatch {
-            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(self.get("rrweb-v4", key)))
-                .unwrap()
-                .build()
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
         }
     }
 
@@ -550,6 +505,7 @@ mod tests {
             stats: BlockStats::default(),
             moments: Vec::new(),
             image_urls: Vec::new(),
+            captured_at_ms: None,
         }
     }
 
@@ -655,7 +611,6 @@ mod tests {
             "2026-10-15",
             "2026-10",
             "images-v4",
-            "rrweb-v4",
             &store,
             at(),
             4,
@@ -706,7 +661,6 @@ mod tests {
             open_frame(&[6; 32], Version::V4, &image_context, sealed_image).unwrap(),
             b"new"
         );
-        assert_eq!(memory.keys("index/images/dt=2026-10-15/").len(), 1);
 
         // The block index row points at the block, keeps the moments, and seals the visited pages.
         blocks[0].moments = vec![Moment {
@@ -716,74 +670,18 @@ mod tests {
             event_index: 1,
         }];
         let stats = BlockStats::default();
-        assert_eq!(
-            write_block_index(
-                &[(&blocks[0], &stats, &written[0])],
-                &keys,
-                &FlushAttempt::new(at()),
-                "rrweb-v4",
-                store.as_ref(),
-                at()
-            )
-            .await
-            .unwrap(),
-            1
-        );
-        let batch = memory.parquet(&memory.keys("index/blocks/")[0]);
-        let column = |name: &str| {
-            batch
-                .column_by_name(name)
-                .unwrap_or_else(|| panic!("no column {name}"))
-                .clone()
+        let attempt = FlushAttempt::new(at());
+        let index =
+            block_index_rows(&[(&blocks[0], &stats, &written[0])], &keys, &attempt).unwrap();
+        let [row] = index.as_slice() else {
+            panic!("one row per stored block");
         };
-        let text = |name: &str| {
-            column(name)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0)
-                .to_owned()
-        };
-        assert_eq!(text("block_s3_key"), block.object_key);
         assert_eq!(
-            column("block_byte_end")
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0),
-            i64::try_from(block.byte_end).unwrap()
+            (row.block_s3_key, row.block_byte_end),
+            (block.object_key.as_str(), block.byte_end)
         );
-        for (name, data_type) in [
-            ("orphan_mutations", DataType::Int32),
-            ("active_ms", DataType::Int64),
-            ("rage_clicks", DataType::Int32),
-            ("cold_start", DataType::Boolean),
-            ("viewport_width", DataType::Int32),
-            ("image_urls", DataType::Int32),
-        ] {
-            assert_eq!(column(name).data_type(), &data_type, "{name}");
-        }
-        let moments = column("moments");
-        let moments = moments
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap()
-            .value(0);
-        let moments = moments.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(
-            moments.column_by_name("event_index").unwrap().data_type(),
-            &DataType::Int32
-        );
-        let kinds = moments.column_by_name("kind").unwrap().clone();
-        assert_eq!(
-            kinds
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "full_snapshot"
-        );
-        let envelope: Value = serde_json::from_str(&text("urls")).unwrap();
+        assert_eq!(row.moments, blocks[0].moments);
+        let envelope: Value = serde_json::from_str(row.urls.as_deref().unwrap()).unwrap();
         let sealed_urls = STANDARD
             .decode(envelope["ciphertext"].as_str().unwrap())
             .unwrap();
@@ -815,9 +713,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn readers_drop_the_rows_of_earlier_attempts_that_a_retry_covers() {
-        let store = MemoryStore::default();
+    #[test]
+    fn readers_drop_the_rows_of_earlier_attempts_that_a_retry_covers() {
         let mut keys = FlushKeys::default();
         for session in ["a", "b", "c"] {
             let (id, key) = session_key(session);
@@ -857,6 +754,7 @@ mod tests {
             flush_id: "0000000000000002".to_owned(),
             flushed_at_ms: 2_000,
         };
+        let mut rows = Vec::new();
         for (attempt, entries) in [
             (&first, vec![(&a, &stats, &wa)]),
             (&between, vec![(&early_b, &stats, &wb)]),
@@ -865,48 +763,12 @@ mod tests {
                 vec![(&a, &stats, &wa), (&b, &stats, &wb), (&c, &stats, &wc)],
             ),
         ] {
-            write_block_index(&entries, &keys, attempt, "rrweb-v4", &store, at())
-                .await
-                .unwrap();
-        }
-
-        let mut rows = Vec::new();
-        for key in store.keys("index/blocks/") {
-            let batch = store.parquet(&key);
-            let text = |name: &str| {
-                batch
-                    .column_by_name(name)
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .clone()
-            };
-            let int = |name: &str| {
-                batch
-                    .column_by_name(name)
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .clone()
-            };
-            let partition = batch
-                .column_by_name("partition")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap()
-                .clone();
-            let (topic, session, flush_id) = (text("topic"), text("session_id"), text("flush_id"));
-            let (start, end, at_ms) =
-                (int("start_offset"), int("end_offset"), int("flushed_at_ms"));
-            for i in 0..batch.num_rows() {
+            for row in block_index_rows(&entries, &keys, attempt).unwrap() {
                 rows.push((
-                    (topic.value(i).to_owned(), partition.value(i)),
-                    (start.value(i), end.value(i)),
-                    (at_ms.value(i), flush_id.value(i).to_owned()),
-                    session.value(i).to_owned(),
+                    (row.topic.to_owned(), row.partition),
+                    (row.start_offset, row.end_offset),
+                    (row.flushed_at_ms, row.flush_id.to_owned()),
+                    row.session_id.to_owned(),
                 ));
             }
         }
