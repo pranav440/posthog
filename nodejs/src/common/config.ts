@@ -44,6 +44,7 @@ export enum PluginServerMode {
     recordings_blob_ingestion_v2_ml_image_fetch_retry = 'recordings-blob-ingestion-v2-ml-image-fetch-retry',
     recordings_blob_ingestion_v2_ml_image_fetch_v4 = 'recordings-blob-ingestion-v2-ml-image-fetch-v4',
     recordings_blob_ingestion_v2_ml_image_fetch_v4_retry = 'recordings-blob-ingestion-v2-ml-image-fetch-v4-retry',
+    recordings_blob_ingestion_v2_ml_parquet_sink_v4 = 'recordings-blob-ingestion-v2-ml-parquet-sink-v4',
     cdp_processed_events = 'cdp-processed-events',
     cdp_person_updates = 'cdp-person-updates',
     cdp_data_warehouse_events = 'cdp-data-warehouse-events',

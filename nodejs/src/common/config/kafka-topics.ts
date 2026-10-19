@@ -60,6 +60,8 @@ export const KAFKA_SESSION_REPLAY_IMAGE_FETCH_V4 = `${prefix}session_replay_imag
 export const KAFKA_SESSION_REPLAY_IMAGE_FETCH_V4_RETRY_1M = `${prefix}ai_research_session_replay_image_fetch_v4_retry_1m${suffix}`
 export const KAFKA_SESSION_REPLAY_IMAGE_FETCH_V4_RETRY_10M = `${prefix}ai_research_session_replay_image_fetch_v4_retry_10m${suffix}`
 export const KAFKA_SESSION_REPLAY_IMAGE_FETCH_V4_RETRY_1H = `${prefix}ai_research_session_replay_image_fetch_v4_retry_1h${suffix}`
+// v4 index rows: v4 recorder -> v4 Parquet sink, one message per Parquet row.
+export const KAFKA_SESSION_REPLAY_ML_INDEX_V4 = `${prefix}session_replay_ml_index_v4${suffix}`
 
 // images the scrub sidecar cannot process, parked so they stop holding the head of their partition.
 // The original bytes are kept: unscrubbed content must never reach the ML bucket, but it must not be

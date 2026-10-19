@@ -22,6 +22,7 @@ import { IngestionSessionReplayMlImageScrubDlqReplayServer } from '~/servers/ing
 import { IngestionSessionReplayMlImageScrubServer } from '~/servers/ingestion-session-replay-ml-image-scrub-server'
 import { IngestionSessionReplayMlMirrorServer } from '~/servers/ingestion-session-replay-ml-mirror-server'
 import { IngestionSessionReplayMlParquetSinkServer } from '~/servers/ingestion-session-replay-ml-parquet-sink-server'
+import { IngestionSessionReplayMlParquetSinkV4Server } from '~/servers/ingestion-session-replay-ml-parquet-sink-v4-server'
 import { IngestionSessionReplayServer } from '~/servers/ingestion-session-replay-server'
 import { IngestionTracesServer } from '~/servers/ingestion-traces-server'
 import { PushApiServer } from '~/servers/push-api-server'
@@ -66,6 +67,9 @@ function createServer(): NodeServer {
 
         case PluginServerMode.recordings_blob_ingestion_v2_ml_image_fetch_v4_retry:
             return new IngestionSessionReplayMlImageFetchV4RetryServer()
+
+        case PluginServerMode.recordings_blob_ingestion_v2_ml_parquet_sink_v4:
+            return new IngestionSessionReplayMlParquetSinkV4Server()
 
         case PluginServerMode.recording_api:
             return new RecordingApiServer()

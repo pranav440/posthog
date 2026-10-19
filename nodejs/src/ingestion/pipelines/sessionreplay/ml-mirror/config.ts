@@ -22,6 +22,19 @@ export type MlMirrorConfig = {
     AI_RESEARCH_REPLAY_V4_IMAGE_FETCH_KEY_BUDGET_MS: number
     /** The share of the v3 per-host limits the v4 lane uses. Each lane's pods hold their own budget, so a host sees both. */
     AI_RESEARCH_REPLAY_V4_IMAGE_FETCH_HOST_BUDGET_SHARE: number
+    /** The v4 index sink: the bucket its Parquet files go to, under `index/`. */
+    AI_RESEARCH_REPLAY_V4_RRWEB_BUCKET: string
+    /** The v4 index sink's consumer group. Its own setting, so a v4 sink pod never joins the v3 sink group. */
+    AI_RESEARCH_REPLAY_V4_PARQUET_SINK_GROUP_ID: string
+    /**
+     * The v4 sink writes its files this long after its last flush, or when the buffer reaches either size below,
+     * whichever comes first. The byte size counts Kafka message bytes, so it also bounds the buffer's memory.
+     */
+    AI_RESEARCH_REPLAY_V4_PARQUET_FLUSH_INTERVAL_MS: number
+    AI_RESEARCH_REPLAY_V4_PARQUET_MAX_ROWS: number
+    AI_RESEARCH_REPLAY_V4_PARQUET_MAX_BYTES: number
+    /** Rows per row group in a v4 index file, so a large file has few row groups. */
+    AI_RESEARCH_REPLAY_V4_PARQUET_ROW_GROUP_ROWS: number
     AI_RESEARCH_REPLAY_S3_PREFIX: string
     /** Bucket of the v3 dataset, which holds only AISR03 frames. Empty until the cutover by session start timestamp selects it. */
     AI_RESEARCH_REPLAY_S3_BUCKET: string
@@ -261,6 +274,12 @@ export function getDefaultMlMirrorConfig(): MlMirrorConfig {
         AI_RESEARCH_REPLAY_V4_IMAGE_FETCH_GROUP_ID: 'session-replay-ml-image-fetch-v4',
         AI_RESEARCH_REPLAY_V4_IMAGE_FETCH_KEY_BUDGET_MS: 60_000,
         AI_RESEARCH_REPLAY_V4_IMAGE_FETCH_HOST_BUDGET_SHARE: 0.25,
+        AI_RESEARCH_REPLAY_V4_RRWEB_BUCKET: '',
+        AI_RESEARCH_REPLAY_V4_PARQUET_SINK_GROUP_ID: 'session-replay-ml-parquet-sink-v4',
+        AI_RESEARCH_REPLAY_V4_PARQUET_FLUSH_INTERVAL_MS: 10 * 60 * 1000,
+        AI_RESEARCH_REPLAY_V4_PARQUET_MAX_ROWS: 1_000_000,
+        AI_RESEARCH_REPLAY_V4_PARQUET_MAX_BYTES: 128 * 1024 * 1024,
+        AI_RESEARCH_REPLAY_V4_PARQUET_ROW_GROUP_ROWS: 131_072,
         AI_RESEARCH_REPLAY_S3_PREFIX: 'rrweb_2',
         AI_RESEARCH_REPLAY_S3_BUCKET: '',
         AI_RESEARCH_REPLAY_S3_V3_PREFIX: 'rrweb_3',

@@ -5,7 +5,8 @@ import { Writable } from 'stream'
 
 export async function parquetRecordsToBuffer(
     schema: ParquetSchema,
-    records: Record<string, unknown>[]
+    records: Record<string, unknown>[],
+    options: { rowGroupSize?: number } = {}
 ): Promise<Buffer> {
     const chunks: Buffer[] = []
     const sink = new Writable({
@@ -19,6 +20,9 @@ export async function parquetRecordsToBuffer(
         schema,
         sink as unknown as Parameters<typeof ParquetWriter.openStream>[1]
     )
+    if (options.rowGroupSize !== undefined) {
+        writer.setRowGroupSize(options.rowGroupSize)
+    }
     for (const record of records) {
         await writer.appendRow(record)
     }
