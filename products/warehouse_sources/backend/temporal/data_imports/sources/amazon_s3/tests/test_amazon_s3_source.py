@@ -8,10 +8,13 @@ from typing import Any, cast
 import pytest
 
 import pyarrow as pa
+import structlog
+from deltalake import write_deltalake
 from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 
 from products.warehouse_sources.backend.temporal.data_imports.sources.amazon_s3.source import AmazonS3Source
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.cursor import SourceCursorManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.config import StoreConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.errors import (
     ACCESS_DENIED_ERROR,
@@ -189,3 +192,52 @@ def test_sync_type_decides_which_files_are_read_and_whether_rows_merge(
         (f"orders/{name}", row_number) for name in expected_files for row_number in (0, 1)
     ]
     assert response.primary_keys == expected_keys
+
+
+@pytest.mark.parametrize(
+    "sync_type, has_stored_cursor, expected_ids, expected_columns",
+    [
+        (ExternalDataSchemaSyncType.APPEND, True, [2], {"id", "_delta_version"}),
+        (ExternalDataSchemaSyncType.APPEND, False, [1, 2], {"id", "_delta_version"}),
+        # A full refresh ignores the stored cursor, and still records the version it wrote.
+        (ExternalDataSchemaSyncType.FULL_REFRESH, True, [1, 2], {"id"}),
+    ],
+)
+def test_delta_sync_reads_from_the_stored_cursor_and_stages_the_next_one(
+    tmp_path: Path,
+    sync_type: ExternalDataSchemaSyncType,
+    has_stored_cursor: bool,
+    expected_ids: list[int],
+    expected_columns: set[str],
+) -> None:
+    table_path = str(tmp_path / "customer-data" / "exports" / "sales")
+    write_deltalake(table_path, pa.table({"id": [1]}))
+    source = _LocalAmazonS3Source(tmp_path)
+    config = make_config()
+    [schema] = source.get_schemas(config, team_id=1)
+    first = source_inputs(schema.name)
+    first.schema_metadata = schema.schema_metadata
+    first_cursor = SourceCursorManager.from_sync_type_config(source, {}, structlog.get_logger())
+    first.source_cursor = first_cursor
+    list(cast(Iterable[pa.Table], source.source_for_pipeline(config, first).items()))
+    stored = {"source_cursor": first_cursor.staged_payload()} if has_stored_cursor else {}
+    write_deltalake(table_path, pa.table({"id": [2]}), mode="append")
+
+    appends = sync_type == ExternalDataSchemaSyncType.APPEND
+    inputs = source_inputs(
+        schema.name,
+        incremental_field=schema.incremental_fields[0]["field"] if appends else None,
+        incremental_field_type=IncrementalFieldType.Integer if appends else None,
+    )
+    inputs.schema_metadata = schema.schema_metadata
+    inputs.sync_type = sync_type
+    cursor = SourceCursorManager.from_sync_type_config(source, stored, structlog.get_logger())
+    inputs.source_cursor = cursor
+    response = source.source_for_pipeline(config, inputs)
+    rows = [row for table in cast(Iterable[pa.Table], response.items()) for row in table.to_pylist()]
+
+    assert sorted(row["id"] for row in rows) == expected_ids
+    assert all(set(row) == expected_columns for row in rows)
+    assert response.destination_reset_required is False
+    staged = cursor.staged_payload()
+    assert staged is not None and staged["data"]["version"] == 1

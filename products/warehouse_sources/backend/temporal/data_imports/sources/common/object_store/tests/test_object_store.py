@@ -1,6 +1,7 @@
 import io
 import csv
 import gzip
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ import pyarrow as pa
 import structlog
 import pyarrow.parquet as pq
 from botocore.stub import Stubber
-from deltalake import write_deltalake
+from deltalake import DeltaTable, write_deltalake
 from fsspec.implementations.local import LocalFileSystem
 from parameterized import parameterized
 
@@ -25,7 +26,11 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
     ObjectStoreConfig,
     ObjectStoreProvider,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.delta import iter_delta_tables
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.delta import (
+    ObjectStorageDeltaCursor,
+    iter_delta_tables,
+    plan_delta_read,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.discovery import (
     TableDefinition,
     group_tables,
@@ -507,6 +512,70 @@ class TestReadTable:
         tables = list(iter_delta_tables(store.delta_uri("sales"), {}, "sales"))
 
         assert [(table.column_names, table.num_rows) for table in tables] == [(["id"], 0)]
+
+
+def _append(path: str) -> None:
+    write_deltalake(path, pa.table({"id": [3], "day": ["b"]}), mode="append")
+
+
+def _overwrite(path: str) -> None:
+    write_deltalake(path, pa.table({"id": [9], "day": ["c"]}), mode="overwrite")
+
+
+def _delete(path: str) -> None:
+    DeltaTable(path).delete("id = 1")
+
+
+def _append_then_compact(path: str) -> None:
+    _append(path)
+    DeltaTable(path).optimize.compact()
+
+
+class TestDeltaCursor:
+    @parameterized.expand(
+        [
+            ("no_cursor_reads_the_snapshot", None, [_append], False, [1, 2, 3], 1),
+            ("appends_read_only_the_new_files", "same", [_append], False, [3], 1),
+            ("an_unchanged_table_reads_nothing", "same", [], False, [], 0),
+            ("an_overwrite_rebuilds", "same", [_overwrite], True, [9], 1),
+            ("a_delete_rebuilds", "same", [_delete], True, [2], 1),
+            # Compaction keeps the rows but moves them to a new file, which an append would read twice.
+            ("a_compaction_rebuilds", "same", [_append_then_compact], True, [1, 2, 3], 2),
+            ("a_recreated_table_rebuilds", "other", [_append], True, [1, 2, 3], 1),
+            ("a_cursor_ahead_of_the_table_rebuilds", "ahead", [], True, [1, 2], 0),
+        ]
+    )
+    def test_plan(
+        self,
+        _name: str,
+        stored_cursor: str | None,
+        commits: list[Any],
+        expected_reset: bool,
+        expected_ids: list[int],
+        expected_version: int,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "sales")
+            write_deltalake(path, pa.table({"id": [1, 2], "day": ["a", "b"]}), partition_by=["day"])
+            table_id = str(DeltaTable(path).metadata().id)
+            stored = {
+                None: None,
+                "same": ObjectStorageDeltaCursor(version=0, table_id=table_id),
+                "other": ObjectStorageDeltaCursor(version=0, table_id="another-table"),
+                "ahead": ObjectStorageDeltaCursor(version=5, table_id=table_id),
+            }[stored_cursor]
+            for commit in commits:
+                commit(path)
+
+            read = plan_delta_read(path, {}, "sales", stored=stored)
+            rows = [row for table in read.iter_tables(with_version=True) for row in table.to_pylist()]
+
+        assert read.reset_required is expected_reset
+        assert read.cursor == ObjectStorageDeltaCursor(version=expected_version, table_id=table_id)
+        assert sorted(row["id"] for row in rows) == expected_ids
+        # Rows read from a subset of the files keep the partition column and carry the version.
+        assert all(set(row) == {"id", "day", "_delta_version"} for row in rows)
+        assert {row["_delta_version"] for row in rows} <= {expected_version}
 
 
 class TestFileSelection:

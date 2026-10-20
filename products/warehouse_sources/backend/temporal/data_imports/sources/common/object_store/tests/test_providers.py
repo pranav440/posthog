@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from unittest.mock import patch
@@ -214,7 +214,9 @@ class TestAzureListing:
         [
             (ResourceNotFoundError("ContainerNotFound"), FileNotFoundError),
             (
-                HttpResponseError("AuthenticationFailed", response=SimpleNamespace(status_code=403, reason="x")),
+                HttpResponseError(
+                    "AuthenticationFailed", response=cast(Any, SimpleNamespace(status_code=403, reason="x"))
+                ),
                 PermissionError,
             ),
         ],

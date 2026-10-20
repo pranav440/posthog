@@ -7,12 +7,18 @@ from structlog.types import FilteringBoundLogger
 
 from products.warehouse_sources.backend.models.util import validate_warehouse_table_url_pattern
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import ConfigType, SimpleSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.cursor import CursorSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.file_parsing import FILE_MODIFIED_AT_COLUMN
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.config import (
     DiscoveryOptions,
     StoreConfig,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.delta import iter_delta_tables
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.delta import (
+    DELTA_VERSION_COLUMN,
+    ObjectStorageDeltaCursor,
+    iter_delta_tables,
+    plan_delta_read,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.discovery import (
     TableDefinition,
     group_tables,
@@ -54,6 +60,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     incremental_field,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
+from products.warehouse_sources.backend.types import IncrementalFieldType
 
 
 def _raise_translated(error: Exception, location: str) -> NoReturn:
@@ -71,12 +78,13 @@ def validate_store_location(config: StoreConfig) -> None:
         raise ObjectStorageError(f"{BLOCKED_LOCATION_ERROR}: {error}")
 
 
-class ObjectStorageSource(SimpleSource[ConfigType], Generic[ConfigType]):
+class ObjectStorageSource(SimpleSource[ConfigType], CursorSource[ObjectStorageDeltaCursor], Generic[ConfigType]):
     """Imports the files in a bucket folder: CSV, JSON Lines and Parquet files, and Delta tables.
 
     A full refresh reads each table in full, so the table matches the bucket at the time of the sync.
     The incremental and append sync types read only the files modified since the last sync. They
-    never remove rows, so the rows of a file deleted from the bucket stay in the table.
+    never remove rows, so the rows of a file deleted from the bucket stay in the table. An append sync
+    of a Delta table reads only the data files committed since the version of the last sync.
     """
 
     @abstractmethod
@@ -84,6 +92,9 @@ class ObjectStorageSource(SimpleSource[ConfigType], Generic[ConfigType]):
 
     @abstractmethod
     def discovery_options(self, config: ConfigType) -> DiscoveryOptions: ...
+
+    def cursor_class(self) -> type[ObjectStorageDeltaCursor]:
+        return ObjectStorageDeltaCursor
 
     def open_store(self, store_config: StoreConfig) -> ObjectStore:
         """Re-check the location every time the stored credentials are about to be sent to it."""
@@ -160,9 +171,11 @@ class ObjectStorageSource(SimpleSource[ConfigType], Generic[ConfigType]):
 
     def source_for_pipeline(self, config: ConfigType, inputs: SourceInputs) -> SourceResponse:
         store = self.open_store(self.object_store_config(config))
-        table = TableDefinition.from_schema_metadata(inputs.schema_name, inputs.schema_metadata)
-        if table is None:
-            table = self._find_table(store, config, inputs.schema_name, inputs.logger)
+        table = TableDefinition.from_schema_metadata(inputs.schema_name, inputs.schema_metadata) or self._find_table(
+            store, config, inputs.schema_name, inputs.logger
+        )
+        if table.kind == "delta":
+            return self._delta_response(store, table, inputs)
         selection = FileSelection.from_inputs(inputs)
 
         def items() -> Iterator[pa.Table]:
@@ -174,6 +187,33 @@ class ObjectStorageSource(SimpleSource[ConfigType], Generic[ConfigType]):
             # Only a merge needs a key. Without one, a full refresh replaces the table and an append adds to it.
             primary_keys=FILE_PRIMARY_KEYS if selection.merges else None,
             chunk_size_bytes=CHUNK_SIZE_BYTES,
+        )
+
+    def _delta_response(self, store: ObjectStore, table: TableDefinition, inputs: SourceInputs) -> SourceResponse:
+        cursor_manager = self.get_cursor_manager(inputs)
+        appends = inputs.should_use_incremental_field
+        # The plan is made here and not in `items`, because the response has to say up front
+        # whether the destination must be rebuilt.
+        read = plan_delta_read(
+            store.delta_uri(table.path),
+            store.delta_storage_options,
+            table.name,
+            stored=cursor_manager.load() if appends else None,
+            logger=inputs.logger,
+        )
+
+        def items() -> Iterator[pa.Table]:
+            # A full refresh stages the cursor too. A later switch to append then continues from
+            # the version the table holds, and not from the cursor of an earlier append.
+            cursor_manager.stage(read.cursor)
+            yield from read.iter_tables(with_version=appends)
+
+        return SourceResponse(
+            name=inputs.schema_name,
+            items=items,
+            primary_keys=None,
+            chunk_size_bytes=CHUNK_SIZE_BYTES,
+            destination_reset_required=read.reset_required,
         )
 
     def _find_table(
@@ -193,9 +233,14 @@ def _source_schema(table: TableDefinition) -> SourceSchema:
     is_files = table.kind == "files"
     return SourceSchema(
         name=table.name,
+        # Delta rows have no key to merge on, so a Delta table can only append.
         supports_incremental=is_files,
-        supports_append=is_files,
-        incremental_fields=[incremental_field(FILE_MODIFIED_AT_COLUMN)] if is_files else [],
+        supports_append=True,
+        incremental_fields=[
+            incremental_field(FILE_MODIFIED_AT_COLUMN)
+            if is_files
+            else incremental_field(DELTA_VERSION_COLUMN, IncrementalFieldType.Integer)
+        ],
         prefers_full_refresh=True,
         schema_metadata=table.schema_metadata(),
     )
