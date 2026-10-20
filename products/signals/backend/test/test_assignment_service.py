@@ -7,6 +7,7 @@ from unittest.mock import patch
 from django.test import SimpleTestCase
 from django.utils import timezone
 
+from asgiref.sync import async_to_sync, sync_to_async
 from parameterized import parameterized
 from social_django.models import UserSocialAuth
 
@@ -30,8 +31,13 @@ from products.signals.backend.assignment_service import (
     StaleAssignmentProposal,
 )
 from products.signals.backend.models import SignalReport, SignalReportArtefact
+from products.signals.backend.report_generation.research import ReportResearchOutput, ResearchReviewerDecision
+from products.signals.backend.report_generation.research_reviewers import resolve_research_reviewers
+from products.signals.backend.report_generation.select_repo import RepoSelectionResult
 from products.signals.backend.scout_harness.tools.report import set_scout_report_reviewers
+from products.signals.backend.slack_inbox_notifications import _resolve_suggested_reviewer_user_ids
 from products.signals.backend.suggested_reviewer_index import report_ids_naming_reviewers, sync_suggested_reviewer_index
+from products.signals.backend.temporal.agentic.report import _persist_agentic_report_artefacts
 
 
 class TestReportAssignmentService(BaseTest):
@@ -203,6 +209,107 @@ class TestReportAssignmentService(BaseTest):
         assert self.service.read().reviewers == ()
         assert result.decision is not None
         assert result.decision.unresolved_candidates[0].github_login == "unlinked-example"
+
+    @parameterized.expand(["access_lost", "unresolved_login"])
+    def test_rejected_selection_retains_valid_recipients(self, rejection: str) -> None:
+        self.service.apply(self.proposal(), actor=ArtefactAttribution.system())
+        if rejection == "access_lost":
+            self.user.is_active = False
+            self.user.save(update_fields=["is_active"])
+            candidate = SuggestedReviewerEntry(user_uuid=str(self.user.uuid))
+        else:
+            candidate = SuggestedReviewerEntry(github_login="unlinked-example")
+        proposal = self.proposal().model_copy(update={"reviewers": (candidate,)})
+        result = self.service.apply(proposal, actor=ArtefactAttribution.system())
+
+        assert self.service.read().reviewers == self.reviewers
+        assert result.decision is not None and result.decision.outcome == "lookup_failed"
+        assert result.decision.retry_reason
+        assert not result.changed
+        assert self.service.apply(proposal, actor=ArtefactAttribution.system()).replayed
+
+    @parameterized.expand(["selected", "empty", "missing", "rejected", "lookup_failed", "human", "stale"])
+    def test_research_selection_controls_inbox_and_notification_recipients(self, selection: str) -> None:
+        self.service.apply(self.proposal(), actor=ArtefactAttribution.system())
+        if selection == "human":
+            self.service.edit_reviewers(SuggestedReviewers(root=[]), actor=self.actor)
+        proposal = self.proposal()
+        if selection == "stale":
+            self.service.edit_reviewers(SuggestedReviewers(root=[]), actor=self.actor)
+        decision = ResearchReviewerDecision.model_validate(
+            {
+                "reviewers": []
+                if selection == "empty"
+                else [
+                    {"user_uuid": str(self.user.uuid), "reason": "Maintains the affected feature."},
+                    {"user_uuid": str(self.member.uuid), "reason": "Owns its integration."},
+                ],
+                "reason": "Current responsibility and related correction evidence.",
+            }
+        )
+        if selection == "rejected":
+            decision.reviewers = decision.reviewers[:1]
+            self.user.is_active = False
+            self.user.save(update_fields=["is_active"])
+        result = ReportResearchOutput(
+            title="Report", summary="Summary", reviewer_decision=None if selection == "missing" else decision
+        )
+        with (
+            patch("products.signals.backend.temporal.agentic.report.assignment_writer_enabled", return_value=True),
+            patch(
+                "products.signals.backend.temporal.agentic.report.database_sync_to_async",
+                side_effect=lambda func, **kwargs: sync_to_async(func, thread_sensitive=True),
+            ),
+            patch("products.signals.backend.temporal.agentic.report._build_reviewers_content") as legacy,
+            patch("products.signals.backend.temporal.agentic.report.capture_suggested_reviewers_resolved"),
+            patch(
+                "products.signals.backend.temporal.agentic.report.resolve_research_reviewers",
+                side_effect=RuntimeError if selection == "lookup_failed" else None,
+                wraps=None if selection == "lookup_failed" else resolve_research_reviewers,
+            ),
+        ):
+            for _ in range(2):
+                async_to_sync(_persist_agentic_report_artefacts)(
+                    self.team.id,
+                    str(self.report.id),
+                    result,
+                    RepoSelectionResult(repository=None, reason="No repository"),
+                    reviewer_proposal=proposal,
+                    reviewer_selection_enabled=True,
+                )
+            legacy.assert_not_called()
+
+        expected = (
+            [self.user, self.member]
+            if selection == "selected"
+            else []
+            if selection in {"empty", "human", "stale"}
+            else [self.member]
+        )
+        assert [entry.user_uuid for entry in self.service.read().reviewers] == [str(user.uuid) for user in expected]
+        assert _resolve_suggested_reviewer_user_ids(self.report) == {user.id for user in expected}
+        for user in [self.user, self.member]:
+            assert bool(
+                list(
+                    report_ids_naming_reviewers(
+                        team_id=self.team.id,
+                        user_uuids=[str(user.uuid)],
+                        github_logins=[],
+                        logins_match_unidentified_only=True,
+                    )
+                )
+            ) == (user in expected)
+        if selection in {"missing", "rejected", "lookup_failed", "empty", "selected"}:
+            saved = self.service.latest_decision()
+            assert saved is not None
+            assert saved.outcome == (
+                "selected"
+                if selection == "selected"
+                else "no_suitable_owner"
+                if selection == "empty"
+                else "lookup_failed"
+            )
+        assert self.report.artefacts.filter(type="assignment_decision").count() == (3 if selection == "human" else 2)
 
     def test_state_and_index_choose_one_reviewer_list_when_timestamps_match(self) -> None:
         timestamp = timezone.now()

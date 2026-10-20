@@ -107,13 +107,24 @@ This is prompt guidance, not an enforced access control, and it does not validat
 
 ## Reviewer notifications
 
-Research suggests reviewers from relevant commit authors and recent code activity. It also checks the finding's relevant paths against `owners.yaml` and the connected repository's CODEOWNERS. When they disagree, the `owners.yaml` owner comes first and a routable CODEOWNERS owner follows. A human edit to the report's reviewer list stays in place on later research runs. Missing ownership files or paths leave the existing author-based suggestions unchanged. Scout-authored reports use their own reviewer selection guidance.
-
-The `signals-research-reviewer-selection` flag lets research choose reviewers and preserve its selected order.
+With `signals-research-reviewer-selection` enabled, the research agent chooses report recipients in relevance order.
+Ownership files, CODEOWNERS, code history, report findings, and human corrections supply evidence for that choice.
+They cannot replace it with an ownership-first or commit-count selection.
 Research first reads recent human corrections from the project profile, which is available on every plan.
 It also reads relevant notes, older activity logs when available, and `reviewer:` scratchpad entries.
 Corrections apply only to the affected area. Research does not save its own choices as reviewer memory.
 The existing limit remains three reviewers.
+
+A missing, malformed, or entirely ineligible decision retains valid existing recipients and records a failed selection.
+An explicit empty decision clears an automatic list. Human choices, including an empty list, remain protected.
+The shared writer rechecks project access before saving; if all proposed candidates have become ineligible, it retains valid existing recipients.
+Report recipients need project access, but do not need GitHub accounts.
+Scout and custom-agent reports also preserve the agent's selected order through the shared writer.
+The saved list drives both the Inbox index and notification recipients; no later ownership selector reranks it.
+
+With research selection disabled, research uses the legacy ownership-and-commit selector.
+That rollback does not release human protection or bypass the shared writer.
+The legacy resolver also remains an independent task-runner permission check; selecting a report recipient does not authorize a task.
 
 The pipeline skips a reviewer row when ordered identities and authorization evidence are unchanged.
 A different explanation alone does not add a row. Human edits retain precedence.
@@ -159,6 +170,7 @@ An accepted request that leaves the list unchanged does not append a reviewer ro
 
 Automatic adapters submit `selected`, `no_suitable_owner`, or `lookup_failed`.
 A deliberate empty result clears an automatic list. A failed lookup retains valid recipients and records a retry reason.
+Rejecting every proposed identity is a failed selection, not a deliberate empty result.
 Every applied recipient must resolve to an active member with current project access, including legacy login-only entries.
 Unresolved candidates remain in the decision log, outside the applied list. The state response exposes their exclusion reasons.
 Access cleanup removes ineligible recipients and retains human control. It does not select replacements.
@@ -205,12 +217,11 @@ comparison of suitability, unresolved results, failures, latency, and cost remai
 
 ### Rollout and rollback
 
-| Control | Allows |
-| --- | --- |
-| `signals-assignment-writer` | Shared rules for all reviewer writers, including permanent protection for human corrections. |
-| `signals-assignment-side-effects` | Existing Slack delivery, automatic task start, GitHub assignment, review requests, and ready-state changes for reports using the writer. |
-| `signals-research-reviewer-selection` | Research reviewer selection and, with the writer and DRI flags, relevance-based PR owner selection. |
-
+| Control                               | Allows                                                                                                                                   |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `signals-assignment-writer`           | Shared rules for all reviewer writers, including permanent protection for human corrections.                                             |
+| `signals-assignment-side-effects`     | Existing Slack delivery, automatic task start, GitHub assignment, review requests, and ready-state changes for reports using the writer. |
+| `signals-research-reviewer-selection` | Agent selection for report recipients without legacy fallback; with the writer and DRI flags, agent selection for PR ownership.          |
 
 The writer and side-effect flags require explicit enablement and support organization targeting.
 Enable the writer and keep side effects disabled to test real assignment changes without those delivery actions.
@@ -218,8 +229,9 @@ With external effects disabled, local activity logs, scoped correction notes, an
 The delivery checks use enrollment, so they still apply after the writer flag is disabled and when queued work runs.
 To stop the trial, disable delivery and the writer. Automatic writes stop on enrolled reports, while human corrections remain usable.
 Reports that never entered the writer keep their existing behavior. Rollback does not reactivate a legacy writer for protected reports.
-The relevance path requires the side-effect control even for a report that has not entered the writer.
-Disabling research selection restores legacy automatic owner ordering while preserving human claims and protected lists.
+The PR relevance path requires the side-effect control even for a report that has not entered the writer.
+Report selection can save decisions while external effects are disabled.
+Disabling research selection restores legacy automatic selection for reports and PRs while preserving human claims and protected lists.
 For an organization-targeted trial, first compare saved inputs offline, then explicitly authorize the delivery control.
 Inspect selection outcomes, correction reasons, actual assignees, and independent autostart decisions before expanding it.
 A flag change cannot retract a sent message or stop an external call that already passed its check.

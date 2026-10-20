@@ -253,6 +253,25 @@ class ReportAssignmentService:
                 if checked_additions.ineligible_user_uuids or checked_additions.unresolved_candidates:
                     raise AssignmentWriteError("New reviewers must be active members with access to this project.")
             validated = self._validate_members(proposed)
+            outcome = proposal.outcome
+            retry_reason = proposal.retry_reason
+            if (
+                proposal.action == "automatic"
+                and control == "automatic"
+                and outcome == "selected"
+                and proposed
+                and not validated.reviewers
+            ):
+                outcome = "lookup_failed"
+                retry_reason = "No selected reviewer is an eligible project member"
+                retained = self._validate_members(snapshot.reviewers)
+                validated = EligibleReviewers(
+                    reviewers=retained.reviewers,
+                    ineligible_user_uuids=tuple(
+                        sorted(set(validated.ineligible_user_uuids) | set(retained.ineligible_user_uuids))
+                    ),
+                    unresolved_candidates=validated.unresolved_candidates,
+                )
             current = (
                 self._artefacts().filter(id=snapshot.state.reviewers_id).first()
                 if snapshot.state.reviewers_id
@@ -283,10 +302,10 @@ class ReportAssignmentService:
                 operation_id=proposal.operation_id,
                 revision=latest_revision + 1,
                 source=proposal.source,
-                outcome=proposal.outcome,
+                outcome=outcome,
                 control=control,
                 expected_state=proposal.expected_state,
-                retry_reason=proposal.retry_reason,
+                retry_reason=retry_reason,
                 ineligible_user_uuids=validated.ineligible_user_uuids,
                 unresolved_candidates=validated.unresolved_candidates,
             )
