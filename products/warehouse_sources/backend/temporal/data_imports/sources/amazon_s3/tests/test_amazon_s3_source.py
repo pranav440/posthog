@@ -10,9 +10,7 @@ from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 
 from products.warehouse_sources.backend.temporal.data_imports.sources.amazon_s3.source import AmazonS3Source
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.config import (
-    ObjectStoreConfig,
-)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.config import StoreConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.errors import (
     ACCESS_DENIED_ERROR,
     INVALID_CONFIG_ERROR,
@@ -42,7 +40,7 @@ class _LocalAmazonS3Source(AmazonS3Source):
         self.root = root.resolve()
         self.fs = fs or LocalFileSystem()
 
-    def open_store(self, store_config: ObjectStoreConfig) -> ObjectStore:
+    def open_store(self, store_config: StoreConfig) -> ObjectStore:
         folder = self.root / store_config.bucket / store_config.prefix
         return ObjectStore(fs=self.fs, root=str(folder).rstrip("/"), delta_uri_prefix="", delta_storage_options={})
 

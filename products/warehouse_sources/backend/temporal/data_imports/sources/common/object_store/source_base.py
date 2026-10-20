@@ -9,7 +9,7 @@ from products.warehouse_sources.backend.models.util import validate_warehouse_ta
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import ConfigType, SimpleSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.config import (
     DiscoveryOptions,
-    ObjectStoreConfig,
+    StoreConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.delta import iter_delta_tables
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.discovery import (
@@ -34,7 +34,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.filesystem import (
     ObjectStore,
-    open_s3_store,
+    open_store,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.formats import (
     iter_file_tables,
@@ -54,7 +54,7 @@ def _raise_translated(error: Exception, location: str) -> NoReturn:
     raise translated from error
 
 
-def validate_store_location(config: ObjectStoreConfig) -> None:
+def validate_store_location(config: StoreConfig) -> None:
     """Apply the checks a self-managed warehouse table URL gets: https, no internal hosts, and no
     bucket that PostHog itself owns."""
     is_valid, error = validate_warehouse_table_url_pattern(config.location_url)
@@ -69,15 +69,15 @@ class ObjectStorageSource(SimpleSource[ConfigType], Generic[ConfigType]):
     """
 
     @abstractmethod
-    def object_store_config(self, config: ConfigType) -> ObjectStoreConfig: ...
+    def object_store_config(self, config: ConfigType) -> StoreConfig: ...
 
     @abstractmethod
     def discovery_options(self, config: ConfigType) -> DiscoveryOptions: ...
 
-    def open_store(self, store_config: ObjectStoreConfig) -> ObjectStore:
+    def open_store(self, store_config: StoreConfig) -> ObjectStore:
         """Re-check the location every time the stored credentials are about to be sent to it."""
         validate_store_location(store_config)
-        return open_s3_store(store_config)
+        return open_store(store_config)
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
@@ -108,7 +108,7 @@ class ObjectStorageSource(SimpleSource[ConfigType], Generic[ConfigType]):
             _raise_translated(e, store_config.display_location)
         if len(objects) >= MAX_DISCOVERY_OBJECTS and logger is not None:
             logger.warning("Reached the object storage listing limit; later objects are ignored")
-        root_name = store_config.prefix.rsplit("/", 1)[-1] if store_config.prefix else store_config.bucket
+        root_name = store_config.prefix.rsplit("/", 1)[-1] if store_config.prefix else store_config.root_name
         return group_tables(objects, self.discovery_options(config), root_name=root_name, logger=logger)
 
     def validate_credentials(

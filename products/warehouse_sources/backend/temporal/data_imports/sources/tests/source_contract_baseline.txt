@@ -78,6 +78,7 @@ AwsStepFunctions fail:rate-limit-budget
 AwsSystemsManager fail:rate-limit-budget
 AwsWaf fail:stall-budget
 AzureApplicationInsights fail:stall-budget
+AzureBlob not-checkable:schemas
 AzureCostManagement not-checkable:no-request
 AzureDevOps fail:rate-limit-budget,stall-budget
 Babelforce fail:stall-budget
@@ -160,6 +161,7 @@ Close fail:rate-limit-budget
 Cloudability fail:stall-budget
 Cloudbeds fail:stall-budget
 Cloudflare fail:stall-budget
+CloudflareR2 not-checkable:schemas
 Cloudinary fail:stall-budget
 Cloudsmith fail:stall-budget
 Cloudzero fail:stall-budget
@@ -318,6 +320,7 @@ Goldcast fail:stall-budget
 Gong fail:rate-limit-budget,stall-budget
 GoogleAds not-checkable:driver:google.ads
 GoogleAnalytics not-checkable:database
+GoogleCloudStorage not-checkable:schemas
 GooglePageSpeedInsights fail:stall-budget
 GooglePlayConsole not-checkable:no-request
 GoogleSearchConsole not-checkable:database
