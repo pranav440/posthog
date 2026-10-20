@@ -1,4 +1,4 @@
-from typing import cast
+from typing import Any, cast
 
 from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
@@ -23,6 +23,10 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
     source_caption,
     text_field,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.self_managed import (
+    SelfManagedCredential,
+    SelfManagedLocation,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.source_base import (
     ObjectStorageSource,
 )
@@ -37,6 +41,7 @@ from products.warehouse_sources.backend.types import ExternalDataSourceType
 class CloudflareR2Source(ObjectStorageSource[CloudflareR2SourceConfig]):
     api_docs_url = "https://developers.cloudflare.com/r2/api/s3/api/"
     requires_team_feature_flag = FEATURE_FLAG
+    self_managed_service = "r2"
 
     @property
     def source_type(self) -> ExternalDataSourceType:
@@ -60,6 +65,16 @@ class CloudflareR2Source(ObjectStorageSource[CloudflareR2SourceConfig]):
 
     def discovery_options(self, config: CloudflareR2SourceConfig) -> DiscoveryOptions:
         return discovery_options_from(config)
+
+    def self_managed_connection_inputs(
+        self, location: SelfManagedLocation, credential: SelfManagedCredential
+    ) -> dict[str, Any]:
+        return {
+            "account_id": location.account or "",
+            "bucket": location.bucket,
+            "access_key_id": credential.access_key,
+            "secret_access_key": credential.access_secret,
+        }
 
     @property
     def get_source_config(self) -> SourceConfig:
