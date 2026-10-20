@@ -52,6 +52,7 @@ from posthog.schema_enums import DatabaseSerializedFieldType
 from posthog.settings import TEST
 from posthog.sync import database_sync_to_async
 
+from products.warehouse_sources.backend.file_uploads import HostedUpload, parse_hosted_upload
 from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
 from products.warehouse_sources.backend.models.util import (
     CLICKHOUSE_HOGQL_MAPPING,
@@ -555,9 +556,19 @@ class DataWarehouseTable(CreatedMetaFields, UpdatedMetaFields, UUIDTModel, Delet
         return self.options.get("csv_allow_double_quotes")
 
     @property
+    def hosted_upload(self) -> HostedUpload | None:
+        """The file this team uploaded that a credential-less table reads in place, if it reads one."""
+        if self.credential_id is not None:
+            return None
+        return parse_hosted_upload(self.team_id, self.url_pattern or "")
+
+    @property
     def is_self_managed(self) -> bool:
-        """ClickHouse reads the table in place from a customer bucket, with the table's own key."""
-        return self.external_data_source_id is None and self.credential_id is not None
+        """ClickHouse reads the table in place: from a customer bucket with the table's own key, or
+        from a file the team uploaded to PostHog's bucket."""
+        if self.external_data_source_id is not None:
+            return False
+        return self.credential_id is not None or self.hosted_upload is not None
 
     def adopt_into_source(self, source: "ExternalDataSource") -> list[str]:
         """Make a self-managed table one that `source` syncs. Returns the fields this changed.
@@ -617,10 +628,11 @@ class DataWarehouseTable(CreatedMetaFields, UpdatedMetaFields, UUIDTModel, Delet
     def delete_with_schema(self) -> bool:
         """Delete the table because the schema that syncs it is deleted. Returns False when the table stays.
 
-        A self-managed table is never PostHog's to delete: the only schema that links to one is a
-        migration schema whose copy has not replaced the table yet.
+        A table the migration links to is never PostHog's to delete: its schema holds a copy that has
+        not replaced the table yet. A file upload source also links its own table before the first
+        sync, and that table goes with the source.
         """
-        if self.is_self_managed:
+        if self.is_self_managed and (self.credential_id is not None or self.is_free_migration_copy):
             self.release_from_migration("The source or table that would have imported it was deleted.")
             return False
         if not self.deleted:

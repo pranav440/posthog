@@ -444,6 +444,8 @@ async def validate_schema_and_update_table(
                 table = table_created
                 previous_queryable_folder = table.queryable_folder
                 storage_delta_mib = _storage_delta_mib(table, live_size_mib)
+                # Read before the URL changes: an uploaded file is recognised by the URL it reads.
+                was_self_managed = table.is_self_managed
                 table.format = table_params["format"]
                 table.url_pattern = new_url_pattern
                 table.queryable_folder = queryable_folder
@@ -459,7 +461,7 @@ async def validate_schema_and_update_table(
                 # new_url_pattern above is derived from the job's own destination folder, not from
                 # request input, so this sync is a trusted writer of a credential-less table's URL.
                 update_fields = ["format", "url_pattern", "queryable_folder", "row_count"]
-                if table.is_self_managed:
+                if was_self_managed:
                     # A self-managed table linked to this schema reads its own bucket until now.
                     update_fields.extend(table.adopt_into_source(job.pipeline))
                     logger.info(f"Adopted self-managed table {table.id} into source {job.pipeline.id}")
@@ -653,6 +655,7 @@ async def register_cdc_companion_table(
             storage_delta_mib = _storage_delta_mib(companion_table, live_size_mib)
             if companion_table:
                 table = companion_table
+                was_self_managed = table.is_self_managed
                 table.format = table_format
                 table.url_pattern = new_url_pattern
                 table.queryable_folder = queryable_folder
@@ -665,7 +668,7 @@ async def register_cdc_companion_table(
                 # new_url_pattern above is derived from the job's own destination folder, not from
                 # request input, so this sync is a trusted writer of a credential-less table's URL.
                 update_fields = ["format", "url_pattern", "queryable_folder", "row_count"]
-                if table.is_self_managed:
+                if was_self_managed:
                     # A self-managed table linked to this schema reads its own bucket until now.
                     update_fields.extend(table.adopt_into_source(job.pipeline))
                     logger.info(f"Adopted self-managed table {table.id} into source {job.pipeline.id}")

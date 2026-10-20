@@ -7,6 +7,7 @@ from posthog.test.base import BaseTest, NonAtomicBaseTest
 from unittest.mock import MagicMock, patch
 
 from django.db import OperationalError, connections, transaction
+from django.test import override_settings
 
 from asgiref.sync import async_to_sync
 from clickhouse_driver.errors import ServerException
@@ -543,14 +544,27 @@ class TestValidateSchemaAndUpdateTable:
         assert job.storage_delta_mib == expected_delta_mib
 
     @pytest.mark.parametrize("row_count", [10, 0])
-    def test_a_linked_self_managed_table_is_adopted_in_the_final_update(self, team: Team, row_count: int) -> None:
+    @pytest.mark.parametrize("uploaded", [False, True])
+    @override_settings(DATAWAREHOUSE_BUCKET="ph-warehouse", DATAWAREHOUSE_BUCKET_DOMAIN="warehouse.example.com")
+    def test_a_linked_self_managed_table_is_adopted_in_the_final_update(
+        self, team: Team, row_count: int, uploaded: bool
+    ) -> None:
         schema, job = self._schema_and_job(team)
         ExternalDataJob.objects.filter(pk=job.pk).update(billable=False)
-        credential = DataWarehouseCredential.objects.create(access_key="AKIAEXAMPLE", access_secret="secret", team=team)
+        # A linked bucket is read with the table's key. An uploaded file has no key and lives in PostHog's bucket.
+        credential = (
+            None
+            if uploaded
+            else DataWarehouseCredential.objects.create(access_key="AKIAEXAMPLE", access_secret="secret", team=team)
+        )
         table = DataWarehouseTable.objects.create(
             name="Raw_Orders",
             format=DataWarehouseTableFormat.CSVWithNames,
-            url_pattern="https://exports.s3.us-east-1.amazonaws.com/orders/*.csv",
+            url_pattern=(
+                f"https://warehouse.example.com/managed/team_{team.pk}/orders.csv"
+                if uploaded
+                else "https://exports.s3.us-east-1.amazonaws.com/orders/*.csv"
+            ),
             team=team,
             credential=credential,
             options={"csv_allow_double_quotes": False, "self_managed_migration": {"state": "triggered"}},
