@@ -27,6 +27,9 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
     ObjectStorageError,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.filesystem import StoredObject
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.incremental import (
+    FILE_ROW_NUMBER_COLUMN,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.settings import (
     CSV_BLOCK_SIZE_BYTES,
     JSONL_CHUNK_BYTES,
@@ -261,16 +264,23 @@ def iter_parquet_tables(
         raise ObjectStorageError(f"{FILE_PARSE_ERROR} '{file_path}' as Parquet: {e}") from e
 
 
-def with_file_columns(table: pa.Table, stored: StoredObject) -> pa.Table:
-    """Tag every row with the file it came from, so a table built from many files stays traceable."""
-    for column in (FILE_PATH_COLUMN, FILE_MODIFIED_AT_COLUMN):
+def with_file_columns(table: pa.Table, stored: StoredObject, first_row_number: int = 0) -> pa.Table:
+    """Tag every row with the file it came from and its position in that file.
+
+    The position counts the rows the file has yielded so far, so it does not depend on how the file
+    was split into chunks.
+    """
+    for column in (FILE_PATH_COLUMN, FILE_MODIFIED_AT_COLUMN, FILE_ROW_NUMBER_COLUMN):
         if column in table.column_names:
             table = table.drop_columns([column])
     rows = table.num_rows
     table = table.append_column(FILE_PATH_COLUMN, pa.repeat(pa.scalar(stored.path, pa.string()), rows))
-    return table.append_column(
+    table = table.append_column(
         FILE_MODIFIED_AT_COLUMN,
         pa.repeat(pa.scalar(stored.modified_at, pa.timestamp("us", tz="UTC")), rows),
+    )
+    return table.append_column(
+        FILE_ROW_NUMBER_COLUMN, pa.array(range(first_row_number, first_row_number + rows), pa.int64())
     )
 
 
@@ -315,8 +325,10 @@ def iter_file_tables(
             tables = iter_csv_tables(binary, csv_options, delimiter, stored.path, logger)
         else:
             tables = iter_jsonl_tables(binary, stored.path)
+    rows_read = 0
     try:
         for table in tables:
-            yield with_file_columns(table, stored)
+            yield with_file_columns(table, stored, rows_read)
+            rows_read += table.num_rows
     except (gzip.BadGzipFile, zlib.error, EOFError) as e:
         raise ObjectStorageError(f"{FILE_PARSE_ERROR} '{stored.path}' as gzip: {e}") from e

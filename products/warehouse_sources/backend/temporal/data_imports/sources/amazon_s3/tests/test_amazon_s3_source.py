@@ -1,5 +1,7 @@
+import os
 import json
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,6 +24,10 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.tes
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.amazons3 import (
     AmazonS3SourceConfig,
 )
+from products.warehouse_sources.backend.types import ExternalDataSchemaSyncType, IncrementalFieldType
+
+# Old enough that an append-only sync treats every file as settled, whatever the real clock says.
+FIRST_MODIFIED_AT = datetime(2024, 5, 1, 12, 0, tzinfo=UTC)
 
 
 class _DeniedFileSystem(LocalFileSystem):
@@ -57,10 +63,12 @@ def make_config(**overrides: Any) -> AmazonS3SourceConfig:
     return AmazonS3SourceConfig.from_dict(values)
 
 
-def write(root: Path, relative: str, content: bytes) -> None:
+def write(root: Path, relative: str, content: bytes, modified_at: datetime | None = None) -> None:
     path = root / "customer-data" / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+    if modified_at is not None:
+        os.utime(path, (modified_at.timestamp(), modified_at.timestamp()))
 
 
 def read_rows(source: AmazonS3Source, config: AmazonS3SourceConfig, schema_name: str, metadata: Any) -> list[dict]:
@@ -125,3 +133,59 @@ def test_validate_credentials(
     assert valid is (expected is None)
     if expected is not None:
         assert message is not None and message.startswith(expected)
+
+
+@pytest.mark.parametrize(
+    "sync_type, last_value, expected_files, expected_keys",
+    [
+        (ExternalDataSchemaSyncType.FULL_REFRESH, None, ["a.csv", "b.csv", "c.csv"], None),
+        (ExternalDataSchemaSyncType.INCREMENTAL, None, ["c.csv", "b.csv", "a.csv"], ["_file_name", "_file_row_number"]),
+        # The file at the watermark is read again, and the merge key replaces its rows.
+        (
+            ExternalDataSchemaSyncType.INCREMENTAL,
+            FIRST_MODIFIED_AT + timedelta(minutes=1),
+            ["b.csv", "a.csv"],
+            ["_file_name", "_file_row_number"],
+        ),
+        # The pipeline can hand the watermark back without a timezone.
+        (
+            ExternalDataSchemaSyncType.INCREMENTAL,
+            (FIRST_MODIFIED_AT + timedelta(minutes=2)).replace(tzinfo=None),
+            ["a.csv"],
+            ["_file_name", "_file_row_number"],
+        ),
+        # An append has no key, so the file at the watermark must not be read again.
+        (ExternalDataSchemaSyncType.APPEND, FIRST_MODIFIED_AT + timedelta(minutes=1), ["a.csv"], None),
+        (ExternalDataSchemaSyncType.APPEND, None, ["c.csv", "b.csv", "a.csv"], None),
+    ],
+)
+def test_sync_type_decides_which_files_are_read_and_whether_rows_merge(
+    tmp_path: Path,
+    sync_type: ExternalDataSchemaSyncType,
+    last_value: datetime | None,
+    expected_files: list[str],
+    expected_keys: list[str] | None,
+) -> None:
+    # Path order is the reverse of age order, so the test tells the two apart.
+    for minutes, name in enumerate(["c.csv", "b.csv", "a.csv"]):
+        write(tmp_path, f"exports/orders/{name}", b"id\n1\n2\n", FIRST_MODIFIED_AT + timedelta(minutes=minutes))
+    source = _LocalAmazonS3Source(tmp_path)
+    config = make_config()
+    [schema] = source.get_schemas(config, team_id=1)
+    is_full_refresh = sync_type == ExternalDataSchemaSyncType.FULL_REFRESH
+    inputs = source_inputs(
+        schema.name,
+        incremental_field=None if is_full_refresh else schema.incremental_fields[0]["field"],
+        incremental_field_type=None if is_full_refresh else IncrementalFieldType.DateTime,
+        db_incremental_field_last_value=last_value,
+    )
+    inputs.schema_metadata = schema.schema_metadata
+    inputs.sync_type = sync_type
+
+    response = source.source_for_pipeline(config, inputs)
+    rows = [row for table in cast(Iterable[pa.Table], response.items()) for row in table.to_pylist()]
+
+    assert [(row["_file_name"], row["_file_row_number"]) for row in rows] == [
+        (f"orders/{name}", row_number) for name in expected_files for row_number in (0, 1)
+    ]
+    assert response.primary_keys == expected_keys

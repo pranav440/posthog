@@ -1,7 +1,7 @@
 import io
 import csv
 import gzip
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -50,9 +50,16 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.formats import (
     iter_csv_tables,
+    iter_file_tables,
     iter_jsonl_tables,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.settings import MAX_TABLES
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.incremental import (
+    FileSelection,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.settings import (
+    JSONL_CHUNK_ROWS,
+    MAX_TABLES,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.source_base import (
     iter_table,
     validate_store_location,
@@ -500,6 +507,49 @@ class TestReadTable:
         tables = list(iter_delta_tables(store.delta_uri("sales"), {}, "sales"))
 
         assert [(table.column_names, table.num_rows) for table in tables] == [(["id"], 0)]
+
+
+class TestFileSelection:
+    @parameterized.expand(
+        [
+            (
+                "changed_files_include_the_watermark_and_come_oldest_first",
+                "changed",
+                1,
+                10,
+                ["b.csv", "c.csv", "a.csv"],
+            ),
+            ("new_files_exclude_the_watermark", "new", 1, 10, ["a.csv"]),
+            ("a_first_append_reads_every_settled_file", "new", None, 10, ["d.csv", "b.csv", "c.csv", "a.csv"]),
+            # The newest file is 30 seconds old, so another file could still get its timestamp.
+            ("an_append_leaves_a_file_that_just_landed_for_the_next_sync", "new", 1, 2.5, []),
+            ("a_changed_sync_reads_a_file_that_just_landed", "changed", 2, 2.5, ["a.csv"]),
+        ]
+    )
+    def test_select(
+        self, _name: str, mode: Any, watermark_minutes: int | None, now_minutes: float, expected: list[str]
+    ) -> None:
+        def at(minutes: float) -> datetime:
+            return MODIFIED_AT + timedelta(minutes=minutes)
+
+        files = [
+            StoredObject(path="a.csv", size=1, modified_at=at(2)),
+            StoredObject(path="c.csv", size=1, modified_at=at(1)),
+            StoredObject(path="b.csv", size=1, modified_at=at(1)),
+            StoredObject(path="d.csv", size=1, modified_at=at(0)),
+        ]
+        selection = FileSelection(mode=mode, watermark=None if watermark_minutes is None else at(watermark_minutes))
+
+        assert [stored.path for stored in selection.select(files, now=at(now_minutes))] == expected
+
+    def test_row_numbers_continue_across_the_chunks_of_one_file(self) -> None:
+        rows = JSONL_CHUNK_ROWS + 3
+        content = b"".join(b'{"n":%d}\n' % number for number in range(rows))
+
+        tables = list(iter_file_tables(io.BytesIO(content), stored("big.jsonl"), "jsonl", CsvOptions()))
+
+        assert len(tables) == 2
+        assert [number for table in tables for number in table["_file_row_number"].to_pylist()] == list(range(rows))
 
 
 class TestLocationAndErrors:

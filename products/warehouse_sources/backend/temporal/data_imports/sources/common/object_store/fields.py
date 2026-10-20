@@ -51,8 +51,9 @@ def discovery_options_from(config: FileOptionsConfig) -> DiscoveryOptions:
 def source_caption(store: str) -> str:
     return (
         f"Import CSV, JSON Lines and Parquet files, and Delta Lake tables, from {store}. PostHog creates one "
-        "table per folder, one per file at the top of the folder you choose, and one per Delta table. Every "
-        "sync reads the files in full, so each table matches the files."
+        "table per folder, one per file at the top of the folder you choose, and one per Delta table. A full "
+        "refresh reads every file again, so the table matches the files. An incremental or append-only sync "
+        "reads only new and changed files, and keeps the rows of files you delete."
     )
 
 
