@@ -165,26 +165,71 @@ Access cleanup removes ineligible recipients and retains human control. It does 
 Task start reads the applied recipients, retains the human editor's permission check, and checks the state again under the report lock.
 Generic artefact PATCH and DELETE cannot change protected reviewer history.
 
+### GitHub PR ownership
+
+With `signals-research-reviewer-selection`, `signals-assignment-writer`, and `signals-pr-dri-assignee` enabled,
+`reviewer_pr_assignment.py` consumes a PR-specific relevance decision instead of shuffling an owning team.
+Existing GitHub assignees and manual unassignment take precedence. A human claimant gets first choice;
+an unavailable claimant does not cause assignment to someone else. A human-protected Inbox list constrains
+the owner to that list, including an empty list. A conflicting claim stops automatic assignment.
+These protections also apply when relevance selection is disabled.
+
+For automatic lists, suitable candidates who opted in come first, in relevance order, followed by other
+suitable candidates in relevance order. Owning-team membership supplies candidates, not a priority class.
+GitHub-only team members remain eligible for PR ownership, subject to current membership and assignability.
+Account-backed candidates also need active project access and a verified linked GitHub identity.
+
+`pr_owner_evidence.py` collects the actual PR paths, current ownership, cached code history, report findings,
+verified identities, and scoped corrections. `pr_owner_selection.py` runs one bounded model assessment through
+the existing Signals LLM client on the assignment worker, without mutation tools. The first assessment needs
+the PR's actual scope; retries reuse it. Repository content and corrections are evidence, never application rules.
+A correction on another report is scoped evidence, not a project-wide exclusion.
+
+`PROwnerDecisionService` stores a server-only `pr_owner_selection` artefact with the captured inputs, their hash,
+the report reviewer state and evidence version, PR head/base SHAs, ordered candidates, reasons, and evidence references.
+It performs model and network calls outside database locks. A short report lock rejects concurrent edits before saving.
+Before the GitHub call, the worker rechecks report and PR versions, human control, access, preferences, and delivery gates.
+The PR decision never rewrites Inbox recipients or grants task-start permission. Review requests still use the current Inbox list.
+
+An explicit `no_suitable_owner` leaves an unassigned PR unassigned. Missing evidence, failed identity lookups,
+and malformed model outputs record `lookup_failed`; they do not fall back to random assignment.
+Successful and empty decisions are reused for the same report/PR version. Failed decisions can be reassessed
+after ten minutes on a later delivery attempt. This is not a retry queue or continuous reassessment service.
+Logs distinguish reuse, validation rejection, human protection, stale state, lookup failure, legacy policy,
+and GitHub application failure. Existing LLM tracing records the assessment.
+
+The offline `signals/eval_pr_owner_selection` suite compares both policies on identical saved inputs without
+constructing assignment, notification, task-start, or PR-creation clients. Its invented regression snapshots and
+controlled-output replay check policy rules, not real assignment accuracy. Recipient-reviewed labels and a live-model
+comparison of suitability, unresolved results, failures, latency, and cost remain prerequisites to a production trial.
+
 ### Rollout and rollback
 
-| Control                           | Allows                                                                                                                                   |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `signals-assignment-writer`       | Shared rules for all reviewer writers, including permanent protection for human corrections.                                             |
+| Control | Allows |
+| --- | --- |
+| `signals-assignment-writer` | Shared rules for all reviewer writers, including permanent protection for human corrections. |
 | `signals-assignment-side-effects` | Existing Slack delivery, automatic task start, GitHub assignment, review requests, and ready-state changes for reports using the writer. |
+| `signals-research-reviewer-selection` | Research reviewer selection and, with the writer and DRI flags, relevance-based PR owner selection. |
 
-Both flags require explicit enablement and support organization targeting.
+
+The writer and side-effect flags require explicit enablement and support organization targeting.
 Enable the writer and keep side effects disabled to test real assignment changes without those delivery actions.
 With external effects disabled, local activity logs, scoped correction notes, and reviewer measurements remain active.
 The delivery checks use enrollment, so they still apply after the writer flag is disabled and when queued work runs.
 To stop the trial, disable delivery and the writer. Automatic writes stop on enrolled reports, while human corrections remain usable.
 Reports that never entered the writer keep their existing behavior. Rollback does not reactivate a legacy writer for protected reports.
+The relevance path requires the side-effect control even for a report that has not entered the writer.
+Disabling research selection restores legacy automatic owner ordering while preserving human claims and protected lists.
+For an organization-targeted trial, first compare saved inputs offline, then explicitly authorize the delivery control.
+Inspect selection outcomes, correction reasons, actual assignees, and independent autostart decisions before expanding it.
 A flag change cannot retract a sent message or stop an external call that already passed its check.
+GitHub reads and writes are not atomic: a human can still act between the final read and the assignment call.
 After-commit scheduling remains best effort. Suppressed actions are not stored for later delivery.
 
 This flag changes the real Inbox list and index. It does not write a shadow copy.
 Test human edit → scout update → human edit, empty human choices, stale proposals, retries, access loss, and failed lookups before expanding the trial.
 Run recipient-reviewed selection comparisons separately; write protection does not prove that the selected owner is suitable.
-Team assignments, separate PR roles, and durable delivery are later changes in [the system design](https://github.com/PostHog/posthog/issues/120572).
+Team assignments, broader PR roles, reconciliation, and durable delivery remain later changes in [the system design](https://github.com/PostHog/posthog/issues/120572).
 The development-only `cleanup_signals` command deletes assignment revisions before their artefacts.
 
 ## Report links

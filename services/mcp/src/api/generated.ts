@@ -74954,6 +74954,7 @@ export namespace Schemas {
      * * `repo_selection` - Repo Selection
      * * `suggested_reviewers` - Suggested Reviewers
      * * `assignment_decision` - Assignment Decision
+     * * `pr_owner_selection` - Pr Owner Selection
      * * `reviewer_control` - Reviewer Control
      * * `channel_assignment` - Channel Assignment
      * * `dismissal` - Dismissal
@@ -74994,6 +74995,7 @@ export namespace Schemas {
       RepoSelection: 'repo_selection',
       SuggestedReviewers: 'suggested_reviewers',
       AssignmentDecision: 'assignment_decision',
+      PrOwnerSelection: 'pr_owner_selection',
       ReviewerControl: 'reviewer_control',
       ChannelAssignment: 'channel_assignment',
       Dismissal: 'dismissal',
