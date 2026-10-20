@@ -9,7 +9,7 @@ import { useMocks } from '~/mocks/jest'
 import { initKeaTests } from '~/test/init'
 
 import { TaskRunStatus } from 'products/posthog_ai/frontend/types/taskTypes'
-import type { ReviewerControlResponseApi, SignalReportCheckApi } from 'products/signals/frontend/generated/api.schemas'
+import type { SignalReportCheckApi } from 'products/signals/frontend/generated/api.schemas'
 
 import { ReportTaskPurpose } from '../components/detail/artefactTypes'
 import { INBOX_EVENTS } from '../inboxAnalytics'
@@ -28,19 +28,7 @@ const linkedTask = (purpose: ReportTaskPurpose, status: TaskRunStatus | null, pr
         startedAt: '2026-01-01T00:00:00Z',
     }) as unknown as ReportTaskEntry
 
-const REVIEWER_CONTROL: ReviewerControlResponseApi = {
-    state: { reviewers_id: 'reviewer-version-1', control_id: 'control-version-1' },
-    control: 'human',
-    enabled: true,
-    issues: [],
-    retry_reason: null,
-}
-
 describe('inboxReportDetailLogic', () => {
-    beforeEach(() => {
-        useMocks({ get: { '/api/projects/:team_id/signals/reports/:id/reviewer_state/': REVIEWER_CONTROL } })
-    })
-
     describe('priority editing', () => {
         let logic: ReturnType<typeof inboxReportDetailLogic.build>
 

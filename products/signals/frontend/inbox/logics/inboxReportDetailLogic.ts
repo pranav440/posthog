@@ -38,14 +38,12 @@ import {
     signalsReportPrReviewCommentReactionsCreate,
     signalsReportPrReviewCommentsCreate,
     signalsReportPrReviewCommentUpdate,
-    signalsReportsReviewerStateRetrieve,
     signalsReportsFeedbackCreate,
     signalsReportsFeedbackStateRetrieve,
     signalsReportsSignalsRetrieve,
     signalsReportsPriorityUpdate,
 } from 'products/signals/frontend/generated/api'
 import type {
-    ReviewerControlResponseApi,
     CommitDiffResponseApi,
     PullRequestCheckApi,
     PullRequestCommentApi,
@@ -363,8 +361,6 @@ export interface inboxReportDetailLogicValues {
     reportTaskToOpen: ReportTaskEntry | null
     reportTasks: ReportTaskEntry[] | null
     reportTasksLoading: boolean
-    reviewerControl: ReviewerControlResponseApi | null
-    reviewerControlLoading: boolean
     savedFeedback: SignalReportFeedbackStateApi | null
     savedFeedbackLoading: boolean
     selectedPullRequest: ReportPullRequest
@@ -570,21 +566,6 @@ export interface inboxReportDetailLogicActions {
         payload?: any
     ) => {
         reportTasks: ReportTaskEntry[]
-        payload?: any
-    }
-    loadReviewerControl: () => any
-    loadReviewerControlFailure: (
-        error: string,
-        errorObject?: any
-    ) => {
-        error: string
-        errorObject?: any
-    }
-    loadReviewerControlSuccess: (
-        reviewerControl: ReviewerControlResponseApi,
-        payload?: any
-    ) => {
-        reviewerControl: ReviewerControlResponseApi
         payload?: any
     }
     openDraftThread: (draft: DraftThread) => {
@@ -841,13 +822,6 @@ export const inboxReportDetailLogic = kea<inboxReportDetailLogicType>([
     }),
 
     loaders(({ props, values }) => ({
-        reviewerControl: [
-            null as ReviewerControlResponseApi | null,
-            {
-                loadReviewerControl: async (): Promise<ReviewerControlResponseApi> =>
-                    await signalsReportsReviewerStateRetrieve(String(teamLogic.values.currentTeamId), props.reportId),
-            },
-        ],
         savedFeedback: [
             null as SignalReportFeedbackStateApi | null,
             {
@@ -1660,12 +1634,15 @@ export const inboxReportDetailLogic = kea<inboxReportDetailLogicType>([
             await breakpoint(300)
             actions.loadAvailableReviewers({ query: query.trim() || undefined })
         },
+        // Persist a reviewer add/remove. The optimistic list is already in place (set by the action's
+        // reducer); on success reload the artefact so we converge on the server's enriched data, and on
+        // failure clear the optimistic override so the UI snaps back. Mirrors desktop `useUpdateSuggestedReviewers`.
         updateReviewers: async ({ content, optimistic }) => {
             let saved = false
             try {
                 await api.signalReports.setReviewers(props.reportId, content)
                 saved = true
-                await Promise.all([asyncActions.loadReportArtefacts(), asyncActions.loadReviewerControl()])
+                await asyncActions.loadReportArtefacts()
             } catch (error: any) {
                 lemonToast.error(error?.detail || error?.message || 'Failed to update reviewers')
             } finally {
@@ -1969,7 +1946,6 @@ export const inboxReportDetailLogic = kea<inboxReportDetailLogicType>([
     afterMount(({ actions, props, values, cache }) => {
         // `loadReportTasks` is cascaded from `loadReportArtefactsSuccess`, so it isn't called here.
         actions.loadFeedback()
-        actions.loadReviewerControl()
         actions.loadReportArtefacts()
         actions.loadReportSignals()
         actions.loadAvailableReviewers()
