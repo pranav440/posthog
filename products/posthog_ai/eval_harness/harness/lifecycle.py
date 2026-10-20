@@ -54,11 +54,14 @@ from .requirements import Infra, infra_union
 if TYPE_CHECKING:
     from .dashboard import EvalDashboard
 from .services import (
+    EVAL_AI_PRODUCT,
     LONG_LIVED_SUBPROCESSES,
     build_local_skills,
+    ensure_ai_gateway_binary,
     ensure_personhog_binaries,
     package_local_skills_archive,
-    start_llm_gateway,
+    provision_ai_gateway_mint_key,
+    start_ai_gateway,
     start_mcp_server,
     start_personhog,
     start_skill_archive_server,
@@ -136,6 +139,7 @@ class SandboxedEvalHarness:
         self._posthog_client: Posthog | None = None
         self._demo_data: SandboxedDemoData | None = None
         self._offline_delivery: OfflineEvalDelivery | None = None
+        self._ai_gateway_mint_key: str | None = None
         # Capture the revision before any eval starts so every result describes the same run.
         self._git_sha = _git("rev-parse", "HEAD")
         self._git_dirty = _worktree_dirty()
@@ -204,6 +208,9 @@ class SandboxedEvalHarness:
                 if Infra.PERSONHOG in required:
                     reporter.setup_started("build personhog")
                     ensure_personhog_binaries()
+                if Infra.AI_GATEWAY in required:
+                    reporter.setup_started("build ai-gateway")
+                    ensure_ai_gateway_binary()
                 reporter.setup_started("start shared services and prepare demo data")
                 self._bootstrap(required, reporter)
                 if self._dashboard:
@@ -304,10 +311,9 @@ class SandboxedEvalHarness:
             self._stack.callback(live_server.stop)
             self._live_server = live_server
 
-        if Infra.LLM_GATEWAY in required:
-            reporter.setup_started("start LLM gateway")
-            assert self._live_server is not None
-            self._stack.callback(start_llm_gateway(self._live_server.url))
+        if Infra.AI_GATEWAY in required:
+            reporter.setup_started("start AI gateway")
+            self._stack.callback(start_ai_gateway())
         if Infra.MCP_SERVER in required:
             reporter.setup_started("build skills and start MCP server")
             assert self._live_server is not None
@@ -356,6 +362,13 @@ class SandboxedEvalHarness:
                 ),
             )
 
+        if Infra.AI_GATEWAY in required:
+            assert self._demo_data is not None and self._database is not None
+            with self._database.blocker.unblock():
+                self._ai_gateway_mint_key = provision_ai_gateway_mint_key(
+                    self._demo_data.master_team_id, agent_model=self.options.agent_model
+                )
+
     async def _run_suites(
         self, suites: Sequence[EvalSuite], required: frozenset[Infra], reporter: ProgressReporter
     ) -> list[SuiteRunResult]:
@@ -387,6 +400,10 @@ class SandboxedEvalHarness:
                     # the same per-process queue lets the single eval worker serve both, and keeps
                     # those workflows off a dev worker the same way.
                     GENERAL_PURPOSE_TASK_QUEUE=temporal_task_queue(),
+                    # Only the eval product routes to the Go gateway. The worker mints each
+                    # run a capped scoped token with this key, as it does in production.
+                    SANDBOX_AI_GATEWAY_PRODUCTS=EVAL_AI_PRODUCT,
+                    SANDBOX_AI_GATEWAY_MINT_KEY=self._ai_gateway_mint_key,
                     **self.provider.settings_overrides(),
                 )
 
