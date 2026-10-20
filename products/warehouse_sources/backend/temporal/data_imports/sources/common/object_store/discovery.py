@@ -29,6 +29,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.globs import (
     compile_clickhouse_glob,
+    glob_key_prefix,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.settings import (
     MAX_TABLE_OBJECTS,
@@ -88,7 +89,7 @@ class TableDefinition:
     def schema_metadata(self) -> dict[str, Any]:
         csv: dict[str, Any] = {"has_header": self.csv.has_header, "allow_double_quotes": self.csv.allow_double_quotes}
         if self.csv.column_types:
-            csv["column_types"] = {column.name: column.kind for column in self.csv.column_types}
+            csv["column_types"] = {column.name: column.to_metadata() for column in self.csv.column_types}
         metadata: dict[str, Any] = {
             "kind": self.kind,
             "scope": self.scope,
@@ -338,8 +339,12 @@ def resolve_table_files(
     """
     if table.kind != "files":
         return table
-    listing_prefix = "" if table.scope == "all" else table.path
-    objects = store.list_objects(listing_prefix, max_objects + 1)
+    if table.scope == "glob":
+        listing_prefix = glob_key_prefix(table.pattern or "")
+        objects = store.list_key_prefix(listing_prefix, max_objects + 1)
+    else:
+        listing_prefix = "" if table.scope == "all" else table.path
+        objects = store.list_objects(listing_prefix, max_objects + 1)
     if len(objects) > max_objects:
         raise ObjectStorageError(
             f"{TOO_MANY_FILES_ERROR} ({max_objects:,} files) in '{listing_prefix or '/'}'. Point the source at a "

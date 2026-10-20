@@ -19,7 +19,10 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
     FileFormatChoice,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.csv_types import (
+    UnsupportedCsvColumnError,
+    clickhouse_base_type,
     csv_column_types_from_columns,
+    stored_clickhouse_types,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.discovery import (
     TableDefinition,
@@ -53,6 +56,8 @@ _FORMATS: dict[str, FileFormatChoice] = {
     "Delta": "delta",
     "DeltaS3Wrapper": "delta",
 }
+# Column types the import pipeline writes as JSON strings, which breaks queries that read their parts.
+_NESTED_TYPES = frozenset({"Array", "Map", "Tuple", "Nested", "JSON", "Object", "Variant", "Dynamic"})
 
 
 class UnmappableTableError(Exception):
@@ -150,6 +155,15 @@ def needs_preserved_column_names(column_names: Iterable[str]) -> bool:
     return any(normalize_column_name(name) != name for name in column_names)
 
 
+def _refuse_nested_columns(columns: Mapping[str, Any] | None) -> None:
+    for name, clickhouse_type in stored_clickhouse_types(columns).items():
+        base = clickhouse_base_type(clickhouse_type)
+        if base in _NESTED_TYPES:
+            raise UnmappableTableError(
+                f"the column '{name}' is a {base}, and the import would store it as text, not as a {base}"
+            )
+
+
 def table_definition_for(
     name: str,
     location: SelfManagedLocation,
@@ -159,6 +173,7 @@ def table_definition_for(
 ) -> TableDefinition:
     """The schema contract that imports exactly the files the table's URL pattern reads."""
     file_format = source_format_for(table_format)
+    _refuse_nested_columns(columns)
     preserve = needs_preserved_column_names((columns or {}).keys())
     if file_format == "delta":
         path = location.key.strip("/")
@@ -182,7 +197,10 @@ def table_definition_for(
         compile_clickhouse_glob(pattern)
     except ObjectStorageError as e:
         raise UnmappableTableError(str(e)) from e
-    is_csv = file_format in ("csv", "csv_no_header")
+    try:
+        column_types = csv_column_types_from_columns(columns) if file_format in ("csv", "csv_no_header") else ()
+    except UnsupportedCsvColumnError as e:
+        raise UnmappableTableError(str(e)) from e
     return TableDefinition(
         name=name,
         kind="files",
@@ -193,7 +211,7 @@ def table_definition_for(
             has_header=file_format == "csv",
             # ClickHouse reads quotes as enclosing a field unless the table turned that off.
             allow_double_quotes=csv_allow_double_quotes is not False,
-            column_types=csv_column_types_from_columns(columns) if is_csv else (),
+            column_types=column_types,
         ),
         pattern=pattern,
         source_format=file_format,

@@ -1,7 +1,10 @@
 import io
+import time
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -19,8 +22,9 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.config import CsvOptions
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.csv_types import (
     CsvColumnType,
+    UnsupportedCsvColumnError,
     cast_csv_columns,
-    csv_column_kind,
+    csv_column_type,
     csv_column_types_from_columns,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.discovery import (
@@ -29,12 +33,14 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.errors import (
     NO_TABLE_FILES_ERROR,
+    TOO_MANY_FILES_ERROR,
     ObjectStorageError,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.filesystem import ObjectStore
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.formats import iter_csv_tables
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.globs import (
     compile_clickhouse_glob,
+    glob_key_prefix,
     glob_listing_prefix,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.self_managed import (
@@ -204,6 +210,24 @@ class TestClickHouseGlob:
             ("literal_dot_is_not_any_character", "a.csv", "aXcsv", False),
             ("literal_path_is_exact", "data/a.csv", "data/a.csv.bak", False),
             ("hidden_files_match_like_clickhouse", "data/*", "data/_SUCCESS", True),
+            ("range_leaves_digits_for_star", "part-{1..12}*.csv", "part-123.csv", True),
+            ("range_does_not_take_extra_digits", "part-{1..12}.csv", "part-123.csv", False),
+            ("empty_alternative", "{a,}x.csv", "x.csv", True),
+            ("padded_range_in_middle", "d={01..31}/h-*.csv", "d=07/h-1.csv", True),
+            ("padded_range_in_middle_refuses_unpadded", "d={01..31}/h-*.csv", "d=7/h-1.csv", False),
+            ("zero_range", "{0..0}", "0", True),
+            ("zero_range_refuses_extra_zero", "{0..0}", "00", False),
+            ("double_star_after_range", "{1..12}**.csv", "123/nested/a.csv", True),
+            ("alternatives_before_star", "{a,ab}*.csv", "abc.csv", True),
+            ("double_star_matches_empty", "**", "", True),
+            ("star_does_not_match_slash", "*", "/", False),
+            ("question_mark_does_not_match_only_slash", "?", "/", False),
+            ("triple_star_crosses_folders", "***", "a/b", True),
+            ("four_stars_match_empty", "****", "", True),
+            ("adjacent_empty_alternatives", "*{a,}{b,}x", "x", True),
+            ("range_leaves_digits_for_literal", "{1..12}3", "123", True),
+            ("padded_reversed_range", "{12..01}", "07", True),
+            ("padded_range_uses_widest_bound", "{0..0012}", "0007", True),
         ]
     )
     def test_matches(self, _name: str, pattern: str, path: str, expected: bool) -> None:
@@ -216,6 +240,11 @@ class TestClickHouseGlob:
             ("nested_glob_in_braces", "{a*,b}.csv"),
             ("square_brackets", "part-[0-9].csv"),
             ("stray_closing_brace", "a}.csv"),
+            ("nested_question_mark", "{a?,b}.csv"),
+            ("nested_brace", "{{a,b},c}.csv"),
+            ("bracket_in_braces", "{a[,b}.csv"),
+            ("closing_bracket_in_braces", "{a],b}.csv"),
+            ("stray_closing_bracket", "a].csv"),
         ]
     )
     def test_refuses_patterns_it_cant_read(self, _name: str, pattern: str) -> None:
@@ -233,6 +262,71 @@ class TestClickHouseGlob:
     )
     def test_listing_prefix(self, _name: str, pattern: str, expected: str) -> None:
         assert glob_listing_prefix(pattern) == expected
+
+    @parameterized.expand(
+        [
+            ("glob_in_file_name", "exports/orders-*.csv", "exports/orders-"),
+            ("glob_at_root", "*.csv", ""),
+            ("range_folder", "y={2023..2024}/a.parquet", "y="),
+            ("literal_file", "events/a.csv", "events/a.csv"),
+            ("question_mark", "a?b", "a"),
+        ]
+    )
+    def test_key_prefix(self, _name: str, pattern: str, expected: str) -> None:
+        assert glob_key_prefix(pattern) == expected
+
+    @parameterized.expand(
+        [
+            ("twenty_stars", "*a" * 20 + "*b.csv"),
+            ("eight_stars", "*a*a*a*a*a*a*a*a*b.csv"),
+        ]
+    )
+    def test_adversarial_match_time(self, _name: str, pattern: str) -> None:
+        glob = compile_clickhouse_glob(pattern)
+        path = "a" * 200 + ".csv"
+
+        started = time.perf_counter()
+        for _ in range(1000):
+            assert glob.matches(path) is False
+        assert time.perf_counter() - started < 2
+        assert glob.matches("a" * 200 + "b.csv") is True
+
+    @parameterized.expand(
+        [
+            ("few_matching_keys", 3, False),
+            ("matching_key_limit", 2, True),
+        ]
+    )
+    def test_resolves_only_the_key_prefix(self, _name: str, max_objects: int, exceeds_limit: bool) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_files(
+                root,
+                {
+                    "exports/other-1.csv": "id\n1\n",
+                    "exports/other-2.csv": "id\n2\n",
+                    "exports/other-3.csv": "id\n3\n",
+                    "exports/orders-2.csv": "id\n2\n",
+                    "exports/orders-1.csv": "id\n1\n",
+                    "exports/orders-3.txt": "id\n3\n",
+                },
+            )
+            table = TableDefinition(
+                name="orders",
+                kind="files",
+                path="exports",
+                scope="glob",
+                file_format="csv",
+                csv=CsvOptions(),
+                pattern="exports/orders-*.csv",
+                source_format="csv",
+            )
+            if exceeds_limit:
+                with pytest.raises(ObjectStorageError, match=f"{TOO_MANY_FILES_ERROR}.*exports/orders-"):
+                    resolve_table_files(local_store(root), table, max_objects=max_objects)
+            else:
+                resolved = resolve_table_files(local_store(root), table, max_objects=max_objects)
+                assert [stored.path for stored in resolved.files] == ["exports/orders-1.csv", "exports/orders-2.csv"]
 
 
 class TestTableDefinition:
@@ -343,6 +437,64 @@ class TestTableDefinition:
 
         assert rebuilt == definition
 
+    def test_metadata_round_trip_keeps_decimal_unsigned_and_time_zone_types(self) -> None:
+        location = parse_self_managed_url("https://exports.s3.us-east-1.amazonaws.com/orders/*.csv")
+        columns = {
+            "total": "Nullable(Decimal(12, 3))",
+            "big": "UInt64",
+            "at": "DateTime64(3, 'Europe/London')",
+            "utc": "DateTime('UTC')",
+        }
+        definition = table_definition_for("orders", location, "CSVWithNames", columns, None)
+
+        metadata = definition.schema_metadata()
+        rebuilt = TableDefinition.from_schema_metadata("orders", metadata)
+
+        assert metadata["csv"]["column_types"] == {
+            "total": {"kind": "decimal", "precision": 12, "scale": 3},
+            "big": "unsigned",
+            "at": {"kind": "datetime", "timezone": "Europe/London"},
+            "utc": "datetime",
+        }
+        assert rebuilt == definition
+
+    @parameterized.expand(
+        [
+            (f"{table_format}_{column_type}", table_format, column_type, url)
+            for table_format, url in (
+                ("Parquet", "https://storage.googleapis.com/lake/orders/*.parquet"),
+                ("JSONEachRow", "https://storage.googleapis.com/lake/orders/*.jsonl"),
+                ("CSVWithNames", "https://storage.googleapis.com/lake/orders/*.csv"),
+                ("Delta", "https://storage.googleapis.com/lake/orders/"),
+            )
+            for column_type in (
+                "Array(Nullable(Int64))",
+                "Map(String, String)",
+                "Tuple(a Nullable(Int64), b Nullable(String))",
+                "Nullable(JSON)",
+                "Object('json')",
+                "Nested(a Int64)",
+            )
+        ]
+    )
+    def test_nested_columns_are_refused(self, _name: str, table_format: str, column_type: str, url: str) -> None:
+        columns = {"id": "Int64", "items": {"clickhouse": column_type, "hogql": "StringJSONDatabaseField"}}
+
+        with pytest.raises(UnmappableTableError, match="'items'"):
+            table_definition_for("orders", parse_self_managed_url(url), table_format, columns, None)
+
+    def test_an_invalid_nested_column_does_not_block_the_table(self) -> None:
+        location = parse_self_managed_url("https://storage.googleapis.com/lake/orders/*.parquet")
+        columns = {"items": {"clickhouse": "Array(Int64)", "hogql": "StringArrayDatabaseField", "valid": False}}
+
+        assert table_definition_for("orders", location, "Parquet", columns, None).kind == "files"
+
+    def test_a_csv_column_no_import_keeps_is_refused(self) -> None:
+        location = parse_self_managed_url("https://storage.googleapis.com/lake/orders/*.csv")
+
+        with pytest.raises(UnmappableTableError, match="'id'"):
+            table_definition_for("orders", location, "CSVWithNames", {"id": "Int128"}, None)
+
     @parameterized.expand(
         [
             ("glob_without_pattern", {"kind": "files", "scope": "glob", "path": "", "format": "csv"}),
@@ -412,29 +564,51 @@ class TestResolveGlobFiles:
 class TestCsvColumnTypes:
     @parameterized.expand(
         [
-            ("Int64", "integer"),
-            ("Nullable(Int32)", "integer"),
-            ("UInt8", "integer"),
-            ("LowCardinality(Nullable(Int16))", "integer"),
-            ("Float32", "float"),
-            ("Nullable(Float64)", "float"),
-            ("Bool", "boolean"),
-            ("Date", "date"),
-            ("Date32", "date"),
-            ("DateTime", "datetime"),
-            ("Nullable(DateTime64(6, 'UTC'))", "datetime"),
-            ("DateTime('Europe/London')", "datetime"),
+            ("Int64", CsvColumnType(name="c", kind="integer")),
+            ("Nullable(Int32)", CsvColumnType(name="c", kind="integer")),
+            ("UInt8", CsvColumnType(name="c", kind="integer")),
+            ("LowCardinality(Nullable(Int16))", CsvColumnType(name="c", kind="integer")),
+            ("UInt64", CsvColumnType(name="c", kind="unsigned")),
+            ("Nullable(UInt64)", CsvColumnType(name="c", kind="unsigned")),
+            ("Float32", CsvColumnType(name="c", kind="float")),
+            ("Nullable(Float64)", CsvColumnType(name="c", kind="float")),
+            ("Decimal(10, 2)", CsvColumnType(name="c", kind="decimal", precision=10, scale=2)),
+            ("Nullable(Decimal(38,0))", CsvColumnType(name="c", kind="decimal", precision=38, scale=0)),
+            ("Decimal32(4)", CsvColumnType(name="c", kind="decimal", precision=9, scale=4)),
+            ("Decimal64(6)", CsvColumnType(name="c", kind="decimal", precision=18, scale=6)),
+            ("Decimal128(10)", CsvColumnType(name="c", kind="decimal", precision=38, scale=10)),
+            ("Bool", CsvColumnType(name="c", kind="boolean")),
+            ("Date", CsvColumnType(name="c", kind="date")),
+            ("Date32", CsvColumnType(name="c", kind="date")),
+            ("DateTime", CsvColumnType(name="c", kind="datetime")),
+            ("Nullable(DateTime64(6, 'UTC'))", CsvColumnType(name="c", kind="datetime")),
+            ("DateTime('Europe/London')", CsvColumnType(name="c", kind="datetime", timezone="Europe/London")),
+            (
+                "Nullable(DateTime64(3, 'America/New_York'))",
+                CsvColumnType(name="c", kind="datetime", timezone="America/New_York"),
+            ),
             ("String", None),
-            ("UInt64", None),
-            ("Int128", None),
-            ("Decimal(10, 2)", None),
             ("Array(Int64)", None),
             ("Nullable(UUID)", None),
             ("", None),
         ]
     )
-    def test_kind_for_stored_type(self, clickhouse_type: str, expected: str | None) -> None:
-        assert csv_column_kind(clickhouse_type) == expected
+    def test_type_for_stored_type(self, clickhouse_type: str, expected: CsvColumnType | None) -> None:
+        assert csv_column_type("c", clickhouse_type) == expected
+
+    @parameterized.expand(
+        [
+            ("int128", "Int128"),
+            ("uint256", "Nullable(UInt256)"),
+            ("decimal_wider_than_38_digits", "Decimal(50, 2)"),
+            ("decimal256", "Decimal256(4)"),
+            ("decimal_without_arguments", "Decimal"),
+            ("unknown_time_zone", "DateTime('Nowhere/Land')"),
+        ]
+    )
+    def test_types_no_import_keeps_are_refused(self, _name: str, clickhouse_type: str) -> None:
+        with pytest.raises(UnsupportedCsvColumnError, match="'c'"):
+            csv_column_type("c", clickhouse_type)
 
     def test_types_from_stored_columns_skip_invalid_and_string_columns(self) -> None:
         columns: dict[str, Any] = {
@@ -499,14 +673,57 @@ class TestCsvColumnTypes:
                 [datetime(2024, 1, 15, 10, 30, tzinfo=UTC), datetime(2024, 1, 15, 10, 30, tzinfo=UTC), None],
                 1,
             ),
+            (
+                "unsigned_keeps_values_above_int64",
+                CsvColumnType(name="value", kind="unsigned"),
+                ["18446744073709551615", "0", "-1", "+7", "18446744073709551616"],
+                [Decimal(18446744073709551615), Decimal(0), None, Decimal(7), None],
+                2,
+            ),
+            (
+                "decimals_keep_their_scale",
+                CsvColumnType(name="value", kind="decimal", precision=10, scale=2),
+                ["1.25", "-3.1", "7", "1.255", "x"],
+                [Decimal("1.25"), Decimal("-3.10"), Decimal("7.00"), None, None],
+                2,
+            ),
+            (
+                "naive_datetimes_take_the_column_time_zone",
+                CsvColumnType(name="value", kind="datetime", timezone="Europe/London"),
+                ["2024-07-01 10:00:00", "2024-01-15 10:00:00"],
+                [datetime(2024, 7, 1, 9, 0, tzinfo=UTC), datetime(2024, 1, 15, 10, 0, tzinfo=UTC)],
+                0,
+            ),
+            (
+                "offsets_win_over_the_column_time_zone",
+                CsvColumnType(name="value", kind="datetime", timezone="Europe/London"),
+                ["2024-07-01T10:00:00Z", "2024-07-01T10:00:00+02:00"],
+                [datetime(2024, 7, 1, 10, 0, tzinfo=UTC), datetime(2024, 7, 1, 8, 0, tzinfo=UTC)],
+                0,
+            ),
+            (
+                "mixed_values_in_a_time_zone_are_read_one_by_one",
+                CsvColumnType(name="value", kind="datetime", timezone="Europe/London"),
+                ["2024-07-01 10:00:00", "2024-07-01T10:00:00Z", "soon"],
+                [datetime(2024, 7, 1, 9, 0, tzinfo=UTC), datetime(2024, 7, 1, 10, 0, tzinfo=UTC), None],
+                1,
+            ),
+            (
+                "repeated_local_time_takes_the_earlier_instant",
+                CsvColumnType(name="value", kind="datetime", timezone="Europe/London"),
+                ["2024-10-27 01:30:00"],
+                [datetime(2024, 10, 27, 0, 30, tzinfo=UTC)],
+                0,
+            ),
         ]
     )
     def test_cast(
         self, _name: str, kind: Any, values: list[str | None], expected: list[Any], expected_nulled: int
     ) -> None:
         table = pa.table({"value": pa.array(values, pa.string()), "other": pa.array(["x"] * len(values))})
+        column_type = kind if isinstance(kind, CsvColumnType) else CsvColumnType(name="value", kind=kind)
 
-        result = cast_csv_columns(table, (CsvColumnType(name="value", kind=kind),))
+        result = cast_csv_columns(table, (column_type,))
 
         assert result.table.column("value").to_pylist() == expected
         assert result.table.column("other").type == pa.string()
@@ -518,6 +735,40 @@ class TestCsvColumnTypes:
         result = cast_csv_columns(table, (CsvColumnType(name="gone", kind="integer"),))
 
         assert result.table.equals(table)
+
+    @parameterized.expand(
+        [
+            ("no_bad_values", 1000, ()),
+            ("one_bad_value", 1000, (517,)),
+            ("bad_first_and_last", 1000, (0, 999)),
+            ("bad_values_in_one_run", 1000, tuple(range(300, 340))),
+            ("scattered_bad_values", 5000, tuple(range(0, 5000, 97))),
+            ("every_value_bad", 200, tuple(range(200))),
+            ("shorter_than_one_slice", 5, (2,)),
+        ]
+    )
+    def test_split_cast_equals_a_value_by_value_cast(self, _name: str, rows: int, bad_rows: tuple[int, ...]) -> None:
+        bad = set(bad_rows)
+        values = [None if row % 11 == 0 else ("x" if row in bad else str(row)) for row in range(rows)]
+        table = pa.table({"value": pa.array(values, pa.string())})
+
+        result = cast_csv_columns(table, (CsvColumnType(name="value", kind="integer"),))
+
+        expected = [None if value in (None, "x") else int(value) for value in values]
+        assert result.table.column("value").to_pylist() == expected
+        bad_non_null = sum(1 for value in values if value == "x")
+        assert result.nulled_values == ({"value": bad_non_null} if bad_non_null else {})
+
+    def test_split_cast_parses_far_fewer_slices_than_values(self) -> None:
+        values = [str(row) for row in range(100_000)]
+        values[54_321] = "x"
+        table = pa.table({"value": pa.array(values, pa.string())})
+
+        started = time.perf_counter()
+        result = cast_csv_columns(table, (CsvColumnType(name="value", kind="integer"),))
+
+        assert time.perf_counter() - started < 1
+        assert result.nulled_values == {"value": 1}
 
     def test_the_reader_casts_typed_columns_and_reports_bad_values(self) -> None:
         logger = MagicMock()
