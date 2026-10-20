@@ -3,7 +3,7 @@ import csv
 import sys
 import time
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from io import StringIO
 from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, cast
 from uuid import UUID
@@ -291,6 +291,9 @@ def run_chdb_query(query: str, timeout: float = CHDB_QUERY_TIMEOUT_SECONDS) -> s
 # The `options` key that marks a table the self-managed migration copied into PostHog storage. The
 # copy is free, so the table's storage is not billed until a billable sync of it removes the key.
 SELF_MANAGED_MIGRATION_OPTION = "self_managed_migration"
+# `options` keys that only PostHog writes. The table API hides them, refuses them, and keeps their
+# stored values, because a client that could write the migration marker could switch off billing.
+SERVER_HELD_OPTIONS = frozenset({SELF_MANAGED_MIGRATION_OPTION})
 
 
 class DataWarehouseTableQuerySet(models.QuerySet["DataWarehouseTable"]):
@@ -569,6 +572,18 @@ class DataWarehouseTable(CreatedMetaFields, UpdatedMetaFields, UUIDTModel, Delet
         # A CSV setting for the customer's files. The table now reads Parquet files PostHog wrote.
         self.options = {key: value for key, value in (self.options or {}).items() if key != "csv_allow_double_quotes"}
         return ["external_data_source", "credential", "options"]
+
+    @staticmethod
+    def server_held_options_in(options: Mapping[str, Any]) -> list[str]:
+        return sorted(key for key in options if key in SERVER_HELD_OPTIONS)
+
+    def client_visible_options(self) -> dict[str, Any]:
+        return {key: value for key, value in (self.options or {}).items() if key not in SERVER_HELD_OPTIONS}
+
+    def with_server_held_options(self, client_options: Mapping[str, Any]) -> dict[str, Any]:
+        """The options a client sent, with the stored values of the keys only PostHog writes."""
+        held = {key: value for key, value in (self.options or {}).items() if key in SERVER_HELD_OPTIONS}
+        return {**client_options, **held}
 
     @property
     def is_free_migration_copy(self) -> bool:
