@@ -27,10 +27,12 @@ import structlog
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
 from temporalio.client import Client
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from posthog.dataclasses import frozen
 from posthog.models.team import Team
 
+from products.access_control.backend.facade.api import object_ids_with_rules
 from products.data_warehouse.backend.facade.api import delete_external_data_schedule, sync_external_data_job_workflow
 from products.warehouse_sources.backend.ad_hoc_sync import (
     SchedulePauseError,
@@ -44,7 +46,10 @@ from products.warehouse_sources.backend.models.external_data_destination import 
     get_or_create_warehouse_destination,
 )
 from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
-from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.models.external_data_schema import (
+    SCHEMA_PINNED_METADATA_KEY,
+    ExternalDataSchema,
+)
 from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
 from products.warehouse_sources.backend.models.table import SELF_MANAGED_MIGRATION_OPTION, DataWarehouseTable
 from products.warehouse_sources.backend.presentation.views.external_data_source.helpers import (
@@ -76,6 +81,8 @@ logger = structlog.get_logger(__name__)
 
 MIGRATION_MARKER_KEY = SELF_MANAGED_MIGRATION_OPTION
 WORKFLOW_ID_PREFIX = "self-managed-migration"
+# The marker state between storing a workflow id and Temporal accepting the run.
+_DISPATCHING = "dispatching"
 DEFAULT_ABANDON_REASON = "Left self-managed by an operator."
 
 # Resolves the region of an S3 bucket whose URL names none, or returns None when it can't.
@@ -91,7 +98,7 @@ class TableMigrationState(StrEnum):
     SKIPPED = "skipped"
 
 
-MigrationAction = Literal["none", "would_start", "started", "would_retry", "retried", "start_failed"]
+MigrationAction = Literal["none", "would_start", "started", "would_retry", "retried", "start_failed", "limit_reached"]
 AbandonAction = Literal["would_abandon", "abandoned", "refused"]
 
 
@@ -149,6 +156,9 @@ class _Evaluation:
     schema: ExternalDataSchema | None = None
     # A copy was started, but its run has not written a job yet. Starting it again would race it.
     awaiting_job: bool = False
+    # The workflow id stored before an earlier start. A new start reuses it, so Temporal refuses a
+    # second run while the first one exists, and a crash after dispatch can't copy the table twice.
+    stored_workflow_id: str | None = None
 
 
 def resolve_s3_bucket_region(bucket: str, credential: SelfManagedCredential) -> str | None:
@@ -212,12 +222,17 @@ class _Planner:
         self._sources = _object_storage_sources()
         self._flag_missing: dict[tuple[int, StorageService], bool] = {}
         self._regions: dict[tuple[str, str], str | None] = {}
+        self._tables_with_rules: dict[int, set[str]] = {}
 
     def plan(self, table: DataWarehouseTable) -> _TablePlan | str:
         """The plan for a table, or the reason the table can't be migrated."""
         credential = _credential_of(table)
         if credential is None:
             return "the table has no credential"
+        if self._has_access_rules(table):
+            # The new source would hold the table's key with default access, and a member the
+            # table's rules shut out could read the same files through a schema of that source.
+            return "the table has its own access rules, which the source PostHog would create can't carry"
         try:
             location = parse_self_managed_url(table.url_pattern)
             source = self._sources.get(location.service)
@@ -237,6 +252,13 @@ class _Planner:
         except UnmappableTableError as e:
             return str(e)
         return _TablePlan(location=location, source=source, definition=definition, job_inputs=job_inputs)
+
+    def _has_access_rules(self, table: DataWarehouseTable) -> bool:
+        if table.team_id not in self._tables_with_rules:
+            self._tables_with_rules[table.team_id] = object_ids_with_rules(
+                team_id=table.team_id, resource="warehouse_table"
+            )
+        return str(table.id) in self._tables_with_rules[table.team_id]
 
     def _team_lacks_flag(self, team: Team, source: ObjectStorageSource[Any]) -> bool:
         key = (team.pk, source.self_managed_service)
@@ -327,14 +349,20 @@ def _evaluate(
     if schema is None or job is None:
         if plan is None:
             return _Evaluation(table=table, status=status(TableMigrationState.SKIPPED, str(planned)), schema=schema)
-        awaiting_job = schema is not None and bool(marker.get("workflow_id"))
-        reason = "waiting for the copy to start" if awaiting_job else "not started"
+        stored_workflow_id = marker.get("workflow_id") if schema is not None else None
+        dispatching = bool(stored_workflow_id) and marker.get("state") == _DISPATCHING
+        awaiting_job = bool(stored_workflow_id) and not dispatching
+        if dispatching:
+            reason = "a start was not confirmed; the next run starts it with the same workflow id"
+        else:
+            reason = "waiting for the copy to start" if awaiting_job else "not started"
         return _Evaluation(
             table=table,
             status=status(TableMigrationState.PENDING, reason),
             plan=plan,
             schema=schema,
             awaiting_job=awaiting_job,
+            stored_workflow_id=stored_workflow_id if isinstance(stored_workflow_id, str) else None,
         )
     if job.status == ExternalDataJobStatus.RUNNING:
         return _Evaluation(table=table, status=status(TableMigrationState.RUNNING), plan=plan, schema=schema)
@@ -415,12 +443,15 @@ def _find_or_create_source(table: DataWarehouseTable, plan: _TablePlan) -> Exter
             }
         },
     )
-    if existing is None:
-        ExternalDataSourceDestination.objects.for_team(table.team_id).create(
-            team_id=table.team_id, source_id=source.pk, destination=get_or_create_warehouse_destination(table.team_id)
-        )
-    # A source's first week of syncs is free (`FREE_HISTORICAL_WINDOW`). Dating the source to the
-    # oldest table it holds keeps the user's own syncs of long-standing tables billed as usual.
+    if existing is not None:
+        return existing
+    ExternalDataSourceDestination.objects.for_team(table.team_id).create(
+        team_id=table.team_id, source_id=source.pk, destination=get_or_create_warehouse_destination(table.team_id)
+    )
+    # A source's first week of syncs is free (`FREE_HISTORICAL_WINDOW`). Dating a new source to the
+    # table it is made for keeps the user's own syncs of long-standing tables billed as usual. Tables
+    # are planned oldest first, so that is the oldest table of the run. An existing source keeps its
+    # date, because moving it would change which of its past syncs fall in the free window.
     if table.created_at < source.created_at:
         ExternalDataSource.objects.filter(pk=source.pk).update(created_at=table.created_at)
         source.created_at = table.created_at
@@ -459,23 +490,53 @@ def _ensure_schema(table: DataWarehouseTable, plan: _TablePlan) -> ExternalDataS
             table=table,
             should_sync=False,
             sync_type=ExternalDataSchema.SyncType.FULL_REFRESH,
-            sync_type_config={"schema_metadata": plan.definition.schema_metadata()},
+            sync_type_config={
+                "schema_metadata": {**plan.definition.schema_metadata(), SCHEMA_PINNED_METADATA_KEY: True}
+            },
         )
     _update_table_marker(table, source_id=str(source.pk), schema_id=str(schema.pk), state="planned")
     return schema
 
 
-def _start_copy(client: Client, table: DataWarehouseTable, schema: ExternalDataSchema) -> str:
+class _CopyAlreadyStartedError(Exception):
+    """Temporal already holds a run with the stored workflow id, so this start added none."""
+
+
+def _new_workflow_id(schema: ExternalDataSchema) -> str:
+    return f"{schema.id}-{WORKFLOW_ID_PREFIX}-{uuid.uuid4().hex[:12]}"
+
+
+def _start_copy(
+    client: Client, table: DataWarehouseTable, schema: ExternalDataSchema, stored_workflow_id: str | None
+) -> str:
+    # Temporal accepted this id before, so a run with it exists or existed.
+    confirmed = stored_workflow_id is not None and _marker(table.options).get("state") == "triggered"
+    workflow_id = stored_workflow_id or _new_workflow_id(schema)
+    if not confirmed:
+        # Stored before the start, so a command that stops between the start and the next write
+        # still knows the id, and its next start can't add a second copy.
+        _update_table_marker(table, state=_DISPATCHING, workflow_id=workflow_id, triggered_at=None)
     # The schedule is created paused, because a run fired by the schedule is billable. The ad hoc
     # run then sees a paused schedule and leaves it paused when it finishes.
     sync_external_data_job_workflow(schema, create=True, should_sync=False, trigger_immediately=False)
-    trigger = trigger_ad_hoc_sync(
-        client, schema, billable=False, reset_pipeline=False, workflow_id_prefix=WORKFLOW_ID_PREFIX
-    )
-    _update_table_marker(
-        table, state="triggered", workflow_id=trigger.workflow_id, triggered_at=timezone.now().isoformat()
-    )
-    return trigger.workflow_id
+    try:
+        trigger_ad_hoc_sync(
+            client,
+            schema,
+            billable=False,
+            reset_pipeline=False,
+            workflow_id_prefix=WORKFLOW_ID_PREFIX,
+            workflow_id=workflow_id,
+        )
+    except WorkflowStartError as e:
+        if not isinstance(e.__cause__, WorkflowAlreadyStartedError):
+            raise
+        if confirmed:
+            raise _CopyAlreadyStartedError(
+                f"the workflow {workflow_id} is still running or already ended without a job; check it in Temporal"
+            ) from e
+    _update_table_marker(table, state="triggered", triggered_at=timezone.now().isoformat())
+    return workflow_id
 
 
 def migrate_self_managed_tables(
@@ -503,7 +564,7 @@ def migrate_self_managed_tables(
             outcomes.append(TableMigrationOutcome(status=evaluation.status))
             continue
         if options.limit is not None and started >= options.limit:
-            outcomes.append(TableMigrationOutcome(status=evaluation.status))
+            outcomes.append(TableMigrationOutcome(status=evaluation.status, action="limit_reached"))
             continue
         if not options.live_run:
             started += 1
@@ -521,12 +582,26 @@ def migrate_self_managed_tables(
 def _start(client: Client | None, evaluation: _Evaluation, is_retry: bool) -> TableMigrationOutcome:
     assert client is not None and evaluation.plan is not None
     table = evaluation.table
+    # A retry after a finished job needs a new workflow id: Temporal refuses the id of a run that ended.
+    stored_workflow_id = (
+        evaluation.stored_workflow_id if evaluation.status.state == TableMigrationState.PENDING else None
+    )
     try:
         schema = evaluation.schema or _ensure_schema(table, evaluation.plan)
-        workflow_id = _start_copy(client, table, schema)
-    except (UnmappableTableError, SchedulePauseError, WorkflowStartError, SyncStillRunningError) as e:
+        workflow_id = _start_copy(client, table, schema, stored_workflow_id)
+    except (
+        UnmappableTableError,
+        SchedulePauseError,
+        WorkflowStartError,
+        SyncStillRunningError,
+        _CopyAlreadyStartedError,
+    ) as e:
         logger.warning("Could not start a self-managed table copy", table_id=str(table.id), error=str(e))
         return TableMigrationOutcome(status=evaluation.status, action="start_failed", error=str(e))
+    except Exception as e:
+        # A Temporal or database error on one table must not stop the batch or hide its outcomes.
+        logger.warning("Could not start a self-managed table copy", table_id=str(table.id), exc_info=True)
+        return TableMigrationOutcome(status=evaluation.status, action="start_failed", error=f"{type(e).__name__}: {e}")
     logger.info(
         "Started a self-managed table copy",
         table_id=str(table.id),
@@ -569,6 +644,14 @@ def abandon_tables(
             outcomes.append(AbandonOutcome(table_id=table_id, action="refused", reason="the table is already migrated"))
         elif job is not None and job.status == ExternalDataJobStatus.RUNNING:
             outcomes.append(AbandonOutcome(table_id=table_id, action="refused", reason="the table's copy is running"))
+        elif schema is not None and job is None and _marker(table.options).get("workflow_id"):
+            outcomes.append(
+                AbandonOutcome(
+                    table_id=table_id,
+                    action="refused",
+                    reason="the table's copy was started and has no job yet; wait until --status shows the job",
+                )
+            )
         elif not live_run:
             outcomes.append(AbandonOutcome(table_id=table_id, action="would_abandon"))
         else:
@@ -579,8 +662,10 @@ def abandon_tables(
 
 def _abandon(table: DataWarehouseTable, schema: ExternalDataSchema | None, reason: str) -> None:
     removed_source_id: str | None = None
-    if schema is not None:
-        with transaction.atomic():
+    # The marker is written with the deletion, so a failure after it can't leave a table that the
+    # next run reads as pending and copies again.
+    with transaction.atomic():
+        if schema is not None:
             # Unlinked first, so deleting the schema can never reach the customer's table.
             schema.table = None
             schema.save(update_fields=["table", "updated_at"])
@@ -593,13 +678,23 @@ def _abandon(table: DataWarehouseTable, schema: ExternalDataSchema | None, reaso
             ):
                 source.soft_delete()
                 removed_source_id = str(source.pk)
-        delete_external_data_schedule(str(schema.id))
-    _update_table_marker(
-        table,
-        state=TableMigrationState.ABANDONED.value,
-        reason=reason,
-        abandoned_at=timezone.now().isoformat(),
-    )
+        _update_table_marker(
+            table,
+            state=TableMigrationState.ABANDONED.value,
+            reason=reason,
+            abandoned_at=timezone.now().isoformat(),
+        )
+    if schema is not None:
+        try:
+            delete_external_data_schedule(str(schema.id))
+        except Exception:
+            # The schedule is paused and its schema is deleted, so it can't start a copy.
+            logger.warning(
+                "Could not delete the schedule of an abandoned migration schema",
+                table_id=str(table.id),
+                schema_id=str(schema.id),
+                exc_info=True,
+            )
     logger.info(
         "Abandoned a self-managed table migration",
         table_id=str(table.id),

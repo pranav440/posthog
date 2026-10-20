@@ -9,16 +9,23 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from parameterized import parameterized
+from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from posthog.hogql.database.database import Database
 
+from posthog.models.organization import OrganizationMembership
 from posthog.models.team import Team
 
+from products.access_control.backend.models.access_control import AccessControl
 from products.warehouse_sources.backend.ad_hoc_sync import AdHocSyncTrigger, WorkflowStartError
 from products.warehouse_sources.backend.models.credential import DataWarehouseCredential
 from products.warehouse_sources.backend.models.external_data_destination import ExternalDataSourceDestination
 from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
-from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.models.external_data_schema import (
+    SCHEMA_PINNED_METADATA_KEY,
+    ExternalDataSchema,
+)
 from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
 from products.warehouse_sources.backend.models.table import DataWarehouseTable
 from products.warehouse_sources.backend.self_managed_migration import (
@@ -46,10 +53,17 @@ def _no_region(_bucket: str, _credential: SelfManagedCredential) -> str | None:
     raise AssertionError("every URL in this test names its region")
 
 
+def _update_marker(table: DataWarehouseTable, **changes: Any) -> None:
+    table.refresh_from_db()
+    table.options = {**table.options, MIGRATION_MARKER_KEY: {**table.options[MIGRATION_MARKER_KEY], **changes}}
+    table.save(update_fields=["options"])
+
+
 class TestSelfManagedMigration(BaseTest):
     def setUp(self) -> None:
         super().setUp()
         self.trigger_count = 0
+        self.workflow_ids: list[str] = []
         patches = [
             patch(f"{MODULE}.source_feature_flag_missing", return_value=False),
             patch(f"{MODULE}.sync_external_data_job_workflow"),
@@ -64,9 +78,14 @@ class TestSelfManagedMigration(BaseTest):
         self.flag_missing, self.sync_schedule, self.trigger, self.delete_schedule, _ = mocks
         self.credential = self._credential("AKIAFIRST")
 
-    def _trigger(self, *_args: Any, **_kwargs: Any) -> AdHocSyncTrigger:
+    def _trigger(self, *_args: Any, **kwargs: Any) -> AdHocSyncTrigger:
         self.trigger_count += 1
-        return AdHocSyncTrigger(workflow_id=f"workflow-{self.trigger_count}", schedule_paused_now=False)
+        self.workflow_ids.append(kwargs["workflow_id"])
+        return AdHocSyncTrigger(workflow_id=kwargs["workflow_id"], schedule_paused_now=False)
+
+    def _marker(self, table: DataWarehouseTable) -> dict[str, Any]:
+        table.refresh_from_db()
+        return table.options[MIGRATION_MARKER_KEY]
 
     def _credential(self, access_key: str) -> DataWarehouseCredential:
         return DataWarehouseCredential.objects.create(access_key=access_key, access_secret="c2VjcmV0", team=self.team)
@@ -155,9 +174,12 @@ class TestSelfManagedMigration(BaseTest):
         expected_contract = table_definition_for(
             "orders", parse_self_managed_url(EXPORTS_URL), "CSVWithNames", table.columns, True
         ).schema_metadata()
-        assert (outcome.action, outcome.workflow_id) == ("started", "workflow-1")
+        assert outcome.action == "started"
+        assert outcome.workflow_id is not None and outcome.workflow_id.startswith(
+            f"{schema.id}-self-managed-migration-"
+        )
         assert (schema.name, schema.should_sync, schema.sync_type) == ("orders", False, "full_refresh")
-        assert schema.sync_type_config == {"schema_metadata": expected_contract}
+        assert schema.sync_type_config == {"schema_metadata": {**expected_contract, SCHEMA_PINNED_METADATA_KEY: True}}
         assert expected_contract["preserve_column_names"] is True
         assert schema.source.source_type == "AmazonS3"
         assert schema.source.created_at == created_at
@@ -168,6 +190,7 @@ class TestSelfManagedMigration(BaseTest):
             "billable": False,
             "reset_pipeline": False,
             "workflow_id_prefix": "self-managed-migration",
+            "workflow_id": outcome.workflow_id,
         }
         table.refresh_from_db()
         assert (table.credential_id, table.url_pattern, table.external_data_source_id) == (
@@ -176,7 +199,8 @@ class TestSelfManagedMigration(BaseTest):
             None,
         )
         assert table.options["csv_allow_double_quotes"] is True
-        assert table.options[MIGRATION_MARKER_KEY]["workflow_id"] == "workflow-1"
+        assert table.options[MIGRATION_MARKER_KEY]["workflow_id"] == outcome.workflow_id
+        assert table.options[MIGRATION_MARKER_KEY]["state"] == "triggered"
 
     def test_a_dry_run_writes_nothing(self) -> None:
         table = self._table()
@@ -211,7 +235,9 @@ class TestSelfManagedMigration(BaseTest):
         )
 
         [retried] = self._migrate(retry_failed=True)
-        assert (retried.action, retried.workflow_id) == ("retried", "workflow-2")
+        assert retried.action == "retried"
+        # A run that wrote a job has ended, and Temporal refuses its id, so the retry takes a new one.
+        assert retried.workflow_id == self.workflow_ids[1] != self.workflow_ids[0]
 
         assert self.trigger_count == 2
         assert ExternalDataSchema.objects.filter(team=self.team).count() == 1
@@ -240,13 +266,82 @@ class TestSelfManagedMigration(BaseTest):
 
         assert (outcome.status.state, outcome.action) == (TableMigrationState.FAILED, "retried")
 
-    def test_a_start_that_never_wrote_a_job_can_be_retried(self) -> None:
+    def test_a_start_that_never_wrote_a_job_is_retried_with_the_same_workflow_id(self) -> None:
         self._table()
         self._migrate()
 
         [outcome] = self._migrate(retry_failed=True)
 
         assert outcome.action == "retried"
+        assert self.workflow_ids[0] == self.workflow_ids[1]
+
+    @parameterized.expand(
+        [
+            ("temporal_never_got_it", None),
+            ("temporal_already_runs_it", WorkflowStartError("already started")),
+        ]
+    )
+    def test_a_crash_after_dispatch_never_starts_a_second_copy(
+        self, _name: str, restart_error: WorkflowStartError | None
+    ) -> None:
+        table = self._table()
+        self._migrate()
+        # The state a command leaves when it stops after the start and before the confirmation.
+        stored_id = self._marker(table)["workflow_id"]
+        _update_marker(table, state="dispatching", triggered_at=None)
+        if restart_error is not None:
+            restart_error.__cause__ = WorkflowAlreadyStartedError(stored_id, "external-data-job")
+            self.trigger.side_effect = restart_error
+
+        [waiting] = evaluate_tables(team_id=self.team.pk, resolve_region=_no_region)
+        assert waiting.reason == "a start was not confirmed; the next run starts it with the same workflow id"
+        [outcome] = self._migrate()
+
+        assert (outcome.action, outcome.workflow_id) == ("started", stored_id)
+        assert self.trigger.call_args.kwargs["workflow_id"] == stored_id
+        assert self._marker(table)["state"] == "triggered"
+        assert ExternalDataSchema.objects.filter(team=self.team).count() == 1
+
+    def test_a_retry_of_a_confirmed_run_that_temporal_still_holds_fails_the_start(self) -> None:
+        table = self._table()
+        self._migrate()
+        stored_id = self._marker(table)["workflow_id"]
+        error = WorkflowStartError("already started")
+        error.__cause__ = WorkflowAlreadyStartedError(stored_id, "external-data-job")
+        self.trigger.side_effect = error
+
+        [outcome] = self._migrate(retry_failed=True)
+
+        assert outcome.action == "start_failed"
+        assert stored_id in (outcome.error or "")
+        assert self._marker(table)["state"] == "triggered"
+
+    @parameterized.expand(
+        [
+            ("schedule_rpc_error", "sync_schedule", RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")),
+            ("schedule_unexpected_error", "sync_schedule", RuntimeError("boom")),
+            ("trigger_unexpected_error", "trigger", RuntimeError("boom")),
+        ]
+    )
+    def test_an_error_on_one_table_fails_only_that_start(self, _name: str, mock_name: str, error: Exception) -> None:
+        self._table("first", created_at=datetime(2024, 1, 1, tzinfo=UTC))
+        self._table("second", url="https://exports.s3.eu-west-1.amazonaws.com/b/*.csv")
+        mock = getattr(self, mock_name)
+        original = mock.side_effect
+        calls = {"count": 0}
+
+        def fail_first(*args: Any, **kwargs: Any) -> Any:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise error
+            return original(*args, **kwargs) if original is not None else None
+
+        mock.side_effect = fail_first
+
+        outcomes = self._migrate()
+
+        assert [(o.status.name, o.action) for o in outcomes] == [("first", "start_failed"), ("second", "started")]
+        assert type(error).__name__ in (outcomes[0].error or "")
 
     @parameterized.expand(
         [
@@ -282,6 +377,33 @@ class TestSelfManagedMigration(BaseTest):
         assert "dwh-object-storage-sources" in (outcome.status.reason or "")
         self.trigger.assert_not_called()
 
+    @parameterized.expand(
+        [
+            ("object_rule_restricts", True, "none", TableMigrationState.SKIPPED),
+            ("object_rule_grants", True, "editor", TableMigrationState.SKIPPED),
+            ("rule_on_another_table", False, "none", TableMigrationState.PENDING),
+        ]
+    )
+    def test_a_table_with_its_own_access_rules_is_skipped(
+        self, _name: str, on_this_table: bool, access_level: str, expected: TableMigrationState
+    ) -> None:
+        table = self._table()
+        other = self._table("other", url="https://exports.s3.eu-west-1.amazonaws.com/o/*.csv")
+        AccessControl.objects.create(
+            team=self.team,
+            resource="warehouse_table",
+            resource_id=str(table.id if on_this_table else other.id),
+            access_level=access_level,
+            organization_member=OrganizationMembership.objects.get(user=self.user, organization=self.organization),
+        )
+
+        outcome = next(o for o in self._migrate() if o.status.table_id == str(table.id))
+
+        assert outcome.status.state == expected
+        if expected == TableMigrationState.SKIPPED:
+            assert "own access rules" in (outcome.status.reason or "")
+            assert not ExternalDataSchema.objects.filter(table=table).exists()
+
     def test_status_reports_every_state(self) -> None:
         pending = self._table("pending_table")
         self._table("skipped_table", url="https://minio.example.com/exports/a.csv")
@@ -296,6 +418,7 @@ class TestSelfManagedMigration(BaseTest):
         migrated.refresh_from_db()
         migrated.adopt_into_source(self._schema_for(migrated).source)
         migrated.save()
+        self._job(abandoned, ExternalDataJobStatus.FAILED)
         abandon_tables([str(abandoned.id)], reason="customer asked to keep it", live_run=True)
 
         assert self._states() == {
@@ -332,18 +455,28 @@ class TestSelfManagedMigration(BaseTest):
 
         outcomes = self._migrate(limit=1, table_ids=(str(second.id), str(third.id)))
 
-        assert [(o.status.name, o.action) for o in outcomes] == [("second", "started"), ("third", "none")]
+        assert [(o.status.name, o.action) for o in outcomes] == [("second", "started"), ("third", "limit_reached")]
         assert not ExternalDataSchema.objects.filter(table=first).exists()
 
-    def test_the_source_is_dated_to_its_oldest_table(self) -> None:
+    def test_a_new_source_is_dated_to_its_oldest_table(self) -> None:
         old = datetime.now(UTC) - timedelta(days=400)
-        self._table("newer", url="https://exports.s3.eu-west-1.amazonaws.com/n/*.csv")
-        self._migrate()
-        older = self._table("older", created_at=old)
+        newer = self._table("newer", url="https://exports.s3.eu-west-1.amazonaws.com/n/*.csv")
+        self._table("older", created_at=old)
 
         self._migrate()
 
-        assert self._schema_for(older).source.created_at == old
+        assert self._schema_for(newer).source.created_at == old
+        assert ExternalDataSource.objects.filter(team=self.team).count() == 1
+
+    def test_an_existing_source_keeps_its_date(self) -> None:
+        newer = self._table("newer", url="https://exports.s3.eu-west-1.amazonaws.com/n/*.csv")
+        self._migrate()
+        source_created_at = self._schema_for(newer).source.created_at
+        older = self._table("older", created_at=datetime.now(UTC) - timedelta(days=400))
+
+        self._migrate()
+
+        assert self._schema_for(older).source.created_at == source_created_at
         assert ExternalDataSource.objects.filter(team=self.team).count() == 1
 
     def test_a_failed_start_keeps_the_schema_and_is_started_by_the_next_run(self) -> None:
@@ -353,14 +486,14 @@ class TestSelfManagedMigration(BaseTest):
         [failed] = self._migrate()
 
         assert (failed.action, failed.error) == ("start_failed", "temporal is down")
-        table.refresh_from_db()
-        assert "workflow_id" not in table.options[MIGRATION_MARKER_KEY]
+        marker = self._marker(table)
+        assert marker["state"] == "dispatching"
         assert table.credential_id == self.credential.pk
 
         self.trigger.side_effect = self._trigger
         [started] = self._migrate()
 
-        assert started.action == "started"
+        assert (started.action, started.workflow_id) == ("started", marker["workflow_id"])
         assert ExternalDataSchema.objects.filter(team=self.team).count() == 1
 
     def test_a_name_already_taken_in_the_bucket_fails_the_start(self) -> None:
@@ -392,6 +525,7 @@ class TestSelfManagedMigration(BaseTest):
     def test_abandon_removes_what_the_migration_made_and_keeps_the_table(self) -> None:
         table = self._table()
         self._migrate()
+        self._job(table, ExternalDataJobStatus.FAILED)
         schema = self._schema_for(table)
 
         [outcome] = abandon_tables([str(table.id)], reason="customer asked to keep it", live_run=True)
@@ -407,10 +541,39 @@ class TestSelfManagedMigration(BaseTest):
         assert self._migrate()[0].status.state == TableMigrationState.ABANDONED
         assert self.trigger_count == 1
 
+    def test_abandon_is_kept_when_the_schedule_delete_fails(self) -> None:
+        table = self._table()
+        self._migrate()
+        self._job(table, ExternalDataJobStatus.FAILED)
+        schema = self._schema_for(table)
+        self.delete_schedule.side_effect = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
+
+        [outcome] = abandon_tables([str(table.id)], reason="customer asked to keep it", live_run=True)
+
+        assert outcome.action == "abandoned"
+        schema.refresh_from_db()
+        assert schema.deleted is True
+        assert self._marker(table)["state"] == "abandoned"
+        assert self._migrate(retry_failed=True)[0].status.state == TableMigrationState.ABANDONED
+        assert self.trigger_count == 1
+
+    @parameterized.expand([("confirmed", "triggered"), ("not_confirmed", "dispatching")])
+    def test_abandon_refuses_a_copy_that_started_without_a_job(self, _name: str, state: str) -> None:
+        table = self._table()
+        self._migrate()
+        _update_marker(table, state=state)
+
+        [outcome] = abandon_tables([str(table.id)], live_run=True)
+
+        assert outcome.action == "refused"
+        assert "has no job yet" in (outcome.reason or "")
+        assert ExternalDataSchema.objects.filter(table=table, deleted=False).exists()
+
     def test_abandon_keeps_a_source_that_holds_other_tables(self) -> None:
         table = self._table()
         other = self._table("other", url="https://exports.s3.eu-west-1.amazonaws.com/o/*.csv")
         self._migrate()
+        self._job(table, ExternalDataJobStatus.FAILED)
 
         abandon_tables([str(table.id)], live_run=True)
 
@@ -450,6 +613,7 @@ class TestSelfManagedMigration(BaseTest):
     def test_a_dry_run_abandon_writes_nothing(self) -> None:
         table = self._table()
         self._migrate()
+        self._job(table, ExternalDataJobStatus.FAILED)
 
         outcomes = abandon_tables([str(table.id), "00000000-0000-0000-0000-000000000000"])
 
