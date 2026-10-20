@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from io import StringIO
 from typing import Any
 
-from posthog.test.base import BaseTest
+from posthog.test.base import APIBaseTest, BaseTest
 from unittest.mock import MagicMock, patch
 
 from django.core.management import call_command
@@ -38,6 +38,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
 from products.warehouse_sources.backend.types import DataWarehouseTableFormat, ExternalDataJobStatus
 
 MODULE = "products.warehouse_sources.backend.self_managed_migration"
+SOURCE_VIEWS = "products.warehouse_sources.backend.presentation.views.external_data_source"
 EXPORTS_URL = "https://exports.s3.eu-west-1.amazonaws.com/orders/*.csv"
 
 
@@ -500,3 +501,72 @@ class TestMigrateSelfManagedTablesCommand(BaseTest):
             assert "name=orders state=skipped" in out.getvalue()
 
         assert not ExternalDataSource.objects.filter(team=self.team).exists()
+
+
+class TestDeletingAMigrationSchema(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        patches = [
+            patch(f"{SOURCE_VIEWS}.base.bulk_delete_external_data_schedules", return_value=[]),
+            patch(f"{SOURCE_VIEWS}.base.delete_external_data_schedule"),
+            patch(f"{SOURCE_VIEWS}.base.delete_discover_schemas_schedule"),
+            patch("products.data_warehouse.backend.s3.get_s3_client"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.source = ExternalDataSource.objects.create(
+            team=self.team,
+            source_type="AmazonS3",
+            job_inputs={},
+            connection_metadata={MIGRATION_MARKER_KEY: {"group_key": "s3/eu-west-1/exports", "credential_id": "c"}},
+        )
+        self.credential = DataWarehouseCredential.objects.create(
+            access_key="AKIAFIRST", access_secret="c2VjcmV0", team=self.team
+        )
+
+    def _linked_table(self, adopted: bool) -> tuple[DataWarehouseTable, ExternalDataSchema]:
+        table = DataWarehouseTable.objects.create(
+            name="orders",
+            format=DataWarehouseTableFormat.CSVWithNames,
+            url_pattern=EXPORTS_URL,
+            team=self.team,
+            credential=None if adopted else self.credential,
+            external_data_source=self.source if adopted else None,
+            options={MIGRATION_MARKER_KEY: {"state": "triggered", "workflow_id": "workflow-1"}},
+        )
+        schema = ExternalDataSchema.objects.create(
+            name="orders", team=self.team, source=self.source, table=table, should_sync=False
+        )
+        return table, schema
+
+    def _delete(self, path: str, schema: ExternalDataSchema) -> None:
+        urls = {
+            "source": f"/api/environments/{self.team.pk}/external_data_sources/{self.source.pk}",
+            "schema": f"/api/environments/{self.team.pk}/external_data_schemas/{schema.pk}",
+            "schema_data": f"/api/environments/{self.team.pk}/external_data_schemas/{schema.pk}/delete_data",
+        }
+        response = self.client.delete(urls[path])
+        assert response.status_code in (200, 204), response.content
+
+    @parameterized.expand([("source",), ("schema",), ("schema_data",)])
+    def test_a_table_that_is_not_adopted_yet_stays_self_managed(self, path: str) -> None:
+        table, schema = self._linked_table(adopted=False)
+
+        self._delete(path, schema)
+
+        table.refresh_from_db()
+        schema.refresh_from_db()
+        assert (table.deleted, table.credential_id, table.url_pattern) == (False, self.credential.pk, EXPORTS_URL)
+        assert schema.table_id is None
+        assert table.options[MIGRATION_MARKER_KEY]["state"] == "abandoned"
+        [status] = evaluate_tables(team_id=self.team.pk, resolve_region=_no_region)
+        assert status.state == TableMigrationState.ABANDONED
+
+    @parameterized.expand([("source",), ("schema",), ("schema_data",)])
+    def test_an_adopted_table_is_deleted_as_before(self, path: str) -> None:
+        table, schema = self._linked_table(adopted=True)
+
+        self._delete(path, schema)
+
+        assert DataWarehouseTable.raw_objects.get(pk=table.pk).deleted is True

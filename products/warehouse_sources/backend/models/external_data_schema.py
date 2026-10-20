@@ -1445,8 +1445,7 @@ class ExternalDataSchema(  # nosemgrep: semgrep.rules.security.prefer-uuid7-djan
             except Exception as e:
                 capture_exception(e)
 
-            if not self.table.deleted:
-                self.table.soft_delete()
+            self.table.delete_with_schema()
 
             self.table_id = None
             self.last_synced_at = None

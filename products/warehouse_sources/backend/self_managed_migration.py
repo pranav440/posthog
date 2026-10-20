@@ -46,7 +46,7 @@ from products.warehouse_sources.backend.models.external_data_destination import 
 from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
 from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
 from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
-from products.warehouse_sources.backend.models.table import DataWarehouseTable
+from products.warehouse_sources.backend.models.table import SELF_MANAGED_MIGRATION_OPTION, DataWarehouseTable
 from products.warehouse_sources.backend.presentation.views.external_data_source.helpers import (
     source_feature_flag_missing,
 )
@@ -74,7 +74,7 @@ from products.warehouse_sources.backend.types import ExternalDataJobStatus
 
 logger = structlog.get_logger(__name__)
 
-MIGRATION_MARKER_KEY = "self_managed_migration"
+MIGRATION_MARKER_KEY = SELF_MANAGED_MIGRATION_OPTION
 WORKFLOW_ID_PREFIX = "self-managed-migration"
 DEFAULT_ABANDON_REASON = "Left self-managed by an operator."
 

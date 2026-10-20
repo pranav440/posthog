@@ -288,10 +288,19 @@ def run_chdb_query(query: str, timeout: float = CHDB_QUERY_TIMEOUT_SECONDS) -> s
     return process.stdout
 
 
+# The `options` key that marks a table the self-managed migration copied into PostHog storage. The
+# copy is free, so the table's storage is not billed until a billable sync of it removes the key.
+SELF_MANAGED_MIGRATION_OPTION = "self_managed_migration"
+
+
 class DataWarehouseTableQuerySet(models.QuerySet["DataWarehouseTable"]):
     def queryable(self) -> "DataWarehouseTableQuerySet":
         # A table you can actually query: not soft-deleted, and not orphaned by a soft-deleted source.
         return self.exclude(deleted=True).exclude(external_data_source__deleted=True)
+
+    def storage_billable(self) -> "DataWarehouseTableQuerySet":
+        """Tables whose PostHog storage is billed: every table but a free self-managed migration copy."""
+        return self.exclude(options__has_key=SELF_MANAGED_MIGRATION_OPTION)
 
 
 # `Manager.from_queryset(...)` can't be used as a base class here because it also overrides
@@ -311,6 +320,9 @@ class DataWarehouseTableManager(models.Manager["DataWarehouseTable"]):
 
     def queryable(self) -> DataWarehouseTableQuerySet:
         return self.get_queryset().queryable()
+
+    def storage_billable(self) -> DataWarehouseTableQuerySet:
+        return self.get_queryset().storage_billable()
 
 
 def get_hogql_field_for_column(
@@ -557,6 +569,48 @@ class DataWarehouseTable(CreatedMetaFields, UpdatedMetaFields, UUIDTModel, Delet
         # A CSV setting for the customer's files. The table now reads Parquet files PostHog wrote.
         self.options = {key: value for key, value in (self.options or {}).items() if key != "csv_allow_double_quotes"}
         return ["external_data_source", "credential", "options"]
+
+    @property
+    def is_free_migration_copy(self) -> bool:
+        return SELF_MANAGED_MIGRATION_OPTION in (self.options or {})
+
+    def end_free_migration_copy(self) -> list[str]:
+        """Bill the table's storage from now on, because a billable sync wrote it. Returns the changed fields."""
+        self.options = {
+            key: value for key, value in (self.options or {}).items() if key != SELF_MANAGED_MIGRATION_OPTION
+        }
+        return ["options"]
+
+    def release_from_migration(self, reason: str) -> None:
+        """Leave a self-managed table that a deleted migration schema linked to as it is.
+
+        The table still reads the customer's bucket with the customer's key. The schema only held a
+        planned copy of it, so deleting the schema must not delete the table. The caller unlinks it.
+        """
+        marker = (self.options or {}).get(SELF_MANAGED_MIGRATION_OPTION)
+        self.options = {
+            **(self.options or {}),
+            SELF_MANAGED_MIGRATION_OPTION: {
+                **(marker if isinstance(marker, dict) else {}),
+                "state": "abandoned",
+                "reason": reason,
+                "abandoned_at": timezone.now().isoformat(),
+            },
+        }
+        self.save(update_fields=["options"])
+
+    def delete_with_schema(self) -> bool:
+        """Delete the table because the schema that syncs it is deleted. Returns False when the table stays.
+
+        A self-managed table is never PostHog's to delete: the only schema that links to one is a
+        migration schema whose copy has not replaced the table yet.
+        """
+        if self.is_self_managed:
+            self.release_from_migration("The source or table that would have imported it was deleted.")
+            return False
+        if not self.deleted:
+            self.soft_delete()
+        return True
 
     def soft_delete(self):
         from products.data_tools.backend.models.join import DataWarehouseJoin

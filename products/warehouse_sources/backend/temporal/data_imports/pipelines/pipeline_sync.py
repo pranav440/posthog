@@ -463,6 +463,11 @@ async def validate_schema_and_update_table(
                     # A self-managed table linked to this schema reads its own bucket until now.
                     update_fields.extend(table.adopt_into_source(job.pipeline))
                     logger.info(f"Adopted self-managed table {table.id} into source {job.pipeline.id}")
+                if job.billable and table.is_free_migration_copy:
+                    # The user turned syncing on, so the table's storage bills like any synced table.
+                    update_fields.extend(
+                        field for field in table.end_free_migration_copy() if field not in update_fields
+                    )
                 if live_size_mib is not None:
                     table.size_in_s3_mib = live_size_mib
                     update_fields.append("size_in_s3_mib")
@@ -664,6 +669,11 @@ async def register_cdc_companion_table(
                     # A self-managed table linked to this schema reads its own bucket until now.
                     update_fields.extend(table.adopt_into_source(job.pipeline))
                     logger.info(f"Adopted self-managed table {table.id} into source {job.pipeline.id}")
+                if job.billable and table.is_free_migration_copy:
+                    # The user turned syncing on, so the table's storage bills like any synced table.
+                    update_fields.extend(
+                        field for field in table.end_free_migration_copy() if field not in update_fields
+                    )
                 if live_size_mib is not None:
                     table.size_in_s3_mib = live_size_mib
                     update_fields.append("size_in_s3_mib")
