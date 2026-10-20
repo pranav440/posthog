@@ -26,7 +26,8 @@ def _split_ids(raw: str | None) -> list[str]:
 
 class Command(BaseCommand):
     help = (
-        "Copy self-managed warehouse tables into object storage sources with one non-billable sync each. "
+        "Copy self-managed warehouse tables (linked buckets and uploaded files) into import sources with one "
+        "non-billable sync each. "
         "Each table keeps its id and name, and its schema stays turned off, so nothing is billed until the "
         "user turns syncing on. Runs only for teams with the object storage sources feature flag. "
         "Without --live-run the command only reports what it would do."
