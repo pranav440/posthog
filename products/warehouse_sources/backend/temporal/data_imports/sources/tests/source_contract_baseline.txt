@@ -262,6 +262,7 @@ Faire fail:stall-budget
 Fastly fail:rate-limit-budget,safe-point,stall-budget
 Featurebase not-checkable:database
 Fieldpulse fail:stall-budget
+FileUpload not-checkable:no-request
 Fillout fail:stall-budget
 Finage fail:stall-budget
 FinancialModelling fail:rate-limit-budget,safe-point,stall-budget
