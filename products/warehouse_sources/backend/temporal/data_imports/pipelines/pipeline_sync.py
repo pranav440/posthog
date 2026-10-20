@@ -459,6 +459,10 @@ async def validate_schema_and_update_table(
                 # new_url_pattern above is derived from the job's own destination folder, not from
                 # request input, so this sync is a trusted writer of a credential-less table's URL.
                 update_fields = ["format", "url_pattern", "queryable_folder", "row_count"]
+                if table.is_self_managed:
+                    # A self-managed table linked to this schema reads its own bucket until now.
+                    update_fields.extend(table.adopt_into_source(job.pipeline))
+                    logger.info(f"Adopted self-managed table {table.id} into source {job.pipeline.id}")
                 if live_size_mib is not None:
                     table.size_in_s3_mib = live_size_mib
                     update_fields.append("size_in_s3_mib")
@@ -656,6 +660,10 @@ async def register_cdc_companion_table(
                 # new_url_pattern above is derived from the job's own destination folder, not from
                 # request input, so this sync is a trusted writer of a credential-less table's URL.
                 update_fields = ["format", "url_pattern", "queryable_folder", "row_count"]
+                if table.is_self_managed:
+                    # A self-managed table linked to this schema reads its own bucket until now.
+                    update_fields.extend(table.adopt_into_source(job.pipeline))
+                    logger.info(f"Adopted self-managed table {table.id} into source {job.pipeline.id}")
                 if live_size_mib is not None:
                     table.size_in_s3_mib = live_size_mib
                     update_fields.append("size_in_s3_mib")
