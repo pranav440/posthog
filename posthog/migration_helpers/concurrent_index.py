@@ -74,6 +74,20 @@ from posthog.dataclasses import frozen
 logger = structlog.get_logger(__name__)
 
 BUILD_POLL_SECONDS = 5
+# Matches the database statement_timeout, which bounds every other statement a deploy runs.
+BUILD_WAIT_SECONDS = 30 * 60
+
+
+class RunningIndexBuildError(RuntimeError):
+    pass
+
+
+@frozen
+class RunningIndexBuild:
+    pid: int
+    phase: str
+    blocks_done: int
+    blocks_total: int
 
 
 def _disable_timeouts(schema_editor) -> None:
@@ -81,29 +95,51 @@ def _disable_timeouts(schema_editor) -> None:
     schema_editor.execute("SET statement_timeout = 0")
 
 
-def _build_in_progress(schema_editor, index_name: str) -> bool:
+def _running_build(schema_editor, index_name: str) -> RunningIndexBuild | None:
     with schema_editor.connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT 1
+            SELECT p.pid, p.phase, p.blocks_done, p.blocks_total
             FROM pg_stat_progress_create_index p
             JOIN pg_class c ON c.oid = p.index_relid
             WHERE c.relname = %s
             """,
             [index_name],
         )
-        return cursor.fetchone() is not None
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return RunningIndexBuild(pid=row[0], phase=row[1], blocks_done=row[2], blocks_total=row[3])
+
+
+def _wait_for_running_build(schema_editor, index_name: str) -> None:
+    deadline = time.monotonic() + BUILD_WAIT_SECONDS
+    while (build := _running_build(schema_editor, index_name)) is not None:
+        if time.monotonic() >= deadline:
+            raise RunningIndexBuildError(
+                f"Index {index_name!r} is still being built by backend pid {build.pid} ({build.phase}) after "
+                f"{BUILD_WAIT_SECONDS} s. Let it finish or cancel it with pg_cancel_backend({build.pid}), then rerun "
+                "the migration. The index was not dropped."
+            )
+        logger.info(
+            "concurrent_index_waiting_for_running_build",
+            index_name=index_name,
+            pid=build.pid,
+            phase=build.phase,
+            blocks_done=build.blocks_done,
+            blocks_total=build.blocks_total,
+        )
+        time.sleep(BUILD_POLL_SECONDS)
 
 
 def _index_validity(schema_editor, index_name: str) -> str | None:
     """None if no index of this name exists, else "valid" or "invalid" (indisvalid).
 
     A build whose client died keeps running on the server with indisvalid = false.
-    Wait for it to finish, so a retry does not drop an index that is about to become valid.
+    Wait for it to finish, up to BUILD_WAIT_SECONDS, so a retry does not drop an index
+    that is about to become valid.
     """
-    while _build_in_progress(schema_editor, index_name):
-        logger.info("concurrent_index_waiting_for_running_build", index_name=index_name)
-        time.sleep(BUILD_POLL_SECONDS)
+    _wait_for_running_build(schema_editor, index_name)
     with schema_editor.connection.cursor() as cursor:
         cursor.execute(
             """
