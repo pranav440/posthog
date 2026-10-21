@@ -369,6 +369,38 @@ def test_safe_add_index_concurrently_recovers_from_invalid_leftover(temp_model, 
 
 
 @pytest.mark.django_db(transaction=True)
+def test_safe_add_index_concurrently_waits_for_a_running_build_instead_of_dropping_it(temp_model, capsys):
+    table, state = temp_model
+    idx_name = f"{table}_col_idx"
+    with connection.cursor() as cursor:
+        cursor.execute(f'CREATE INDEX "{idx_name}" ON "{table}" (col)')
+        cursor.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = %s::regclass", [idx_name])
+        cursor.execute("SELECT %s::regclass::oid", [idx_name])
+        oid_before = cursor.fetchone()[0]
+    checks = iter([True, False])
+
+    def build_finishes(schema_editor, index_name):
+        running = next(checks)
+        if not running:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE pg_index SET indisvalid = true WHERE indexrelid = %s::regclass", [idx_name])
+        return running
+
+    op = SafeAddIndexConcurrently(model_name=MODEL_NAME, index=models.Index(fields=["col"], name=idx_name))
+    with (
+        patch("posthog.migration_helpers.concurrent_index._build_in_progress", side_effect=build_finishes),
+        patch("posthog.migration_helpers.concurrent_index.time.sleep"),
+    ):
+        _apply_forwards(op, state)
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT %s::regclass::oid", [idx_name])
+        assert cursor.fetchone()[0] == oid_before
+    assert _index_is_valid(idx_name)
+    assert "invalid state by a prior interrupted build" not in capsys.readouterr().out
+
+
+@pytest.mark.django_db(transaction=True)
 def test_safe_add_index_concurrently_partial_descending(temp_model):
     """Delegating to schema_editor.add_index covers index shapes the raw-SQL
     helper would force you to hand-translate (ordering, partial predicate).

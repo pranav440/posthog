@@ -59,6 +59,8 @@ can't model):
 The Migration class still needs `atomic = False`.
 """
 
+import time
+
 from django.contrib.postgres.operations import AddIndexConcurrently, NotInTransactionMixin, RemoveIndexConcurrently
 from django.db import migrations, router
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
@@ -71,14 +73,37 @@ from posthog.dataclasses import frozen
 
 logger = structlog.get_logger(__name__)
 
+BUILD_POLL_SECONDS = 5
+
 
 def _disable_timeouts(schema_editor) -> None:
     schema_editor.execute("SET lock_timeout = 0")
     schema_editor.execute("SET statement_timeout = 0")
 
 
+def _build_in_progress(schema_editor, index_name: str) -> bool:
+    with schema_editor.connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM pg_stat_progress_create_index p
+            JOIN pg_class c ON c.oid = p.index_relid
+            WHERE c.relname = %s
+            """,
+            [index_name],
+        )
+        return cursor.fetchone() is not None
+
+
 def _index_validity(schema_editor, index_name: str) -> str | None:
-    """None if no index of this name exists, else "valid" or "invalid" (indisvalid)."""
+    """None if no index of this name exists, else "valid" or "invalid" (indisvalid).
+
+    A build whose client died keeps running on the server with indisvalid = false.
+    Wait for it to finish, so a retry does not drop an index that is about to become valid.
+    """
+    while _build_in_progress(schema_editor, index_name):
+        logger.info("concurrent_index_waiting_for_running_build", index_name=index_name)
+        time.sleep(BUILD_POLL_SECONDS)
     with schema_editor.connection.cursor() as cursor:
         cursor.execute(
             """
