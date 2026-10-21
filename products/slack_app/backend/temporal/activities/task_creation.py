@@ -729,12 +729,23 @@ def create_posthog_code_task_for_repo_activity(
     # PR tooling enabled so an explicit follow-up can clone a repo and publish.
     allow_pr_creation = True
 
-    from products.slack_app.backend.facade.run_preferences import resolve_run_preferences
+    from products.slack_app.backend.facade.run_preferences import (
+        resolve_effective_runtime_adapter,
+        resolve_run_preferences,
+    )
 
     run_prefs = resolve_run_preferences(override=model_override, team_id=integration.team_id, user_id=user_id)
     mentioner = User.objects.filter(id=user_id, is_active=True).first()
     own_plan_state = (
-        _own_plan_state(integration, mentioner, runtime_adapter=run_prefs.runtime_adapter) if mentioner else {}
+        _own_plan_state(
+            integration,
+            mentioner,
+            runtime_adapter=resolve_effective_runtime_adapter(
+                run_prefs.runtime_adapter, team_id=integration.team_id, user_id=user_id
+            ),
+        )
+        if mentioner
+        else {}
     )
 
     # File into the creator's personal "#me" channel so the task surfaces in PostHog Desktop's
@@ -1464,6 +1475,7 @@ def _resume_task_with_new_run(
     model_override: SlackAppModelOverride | None = None,
 ) -> bool:
     """Create a new run on the same task when a follow-up arrives after the previous run completed."""
+    from products.slack_app.backend.facade.run_preferences import resolve_effective_runtime_adapter
     from products.slack_app.backend.services.slack_messages import (  # noqa: PLC0415
         decode_slack_event_text,
         labeled_mentions_to_display_names,
@@ -1529,7 +1541,14 @@ def _resume_task_with_new_run(
     # picked up too.
     extra_state.update(_run_preference_state(model_override, team_id=mapping.task.team_id, user_id=run_actor.id))
     # The thread creator's plan, whoever replies: the creator chose who may join their thread.
-    own_plan_state = _own_plan_state(integration, created_by, runtime_adapter=extra_state.get("runtime_adapter"))
+    # `create_run` resolves the defaults for the replying user, so the runtime is read for them too.
+    own_plan_state = _own_plan_state(
+        integration,
+        created_by,
+        runtime_adapter=resolve_effective_runtime_adapter(
+            extra_state.get("runtime_adapter"), team_id=mapping.task.team_id, user_id=run_actor.id
+        ),
+    )
     extra_state.update(own_plan_state)
 
     extra_state.update(tasks_facade.get_resume_snapshot_carry_state(previous_state))
