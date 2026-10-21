@@ -1227,25 +1227,30 @@ def _may_join_thread(
 ) -> bool:
     """Whether someone other than the thread creator may send this message to the thread's task.
 
-    The creator's join mode decides. Under ``ask`` the creator gets a prompt, and the message is
-    sent again once they let this person join.
+    The creator's join mode decides. Under either ask mode the creator gets a prompt, and the
+    message is sent again once they approve.
     """
     from products.slack_app.backend.api import post_thread_join_prompt  # noqa: PLC0415
-    from products.slack_app.backend.models import ThreadJoinMode  # noqa: PLC0415
+    from products.slack_app.backend.models import SlackThreadJoin, ThreadJoinMode  # noqa: PLC0415
     from products.slack_app.backend.services.slack_settings import resolve_thread_join_mode  # noqa: PLC0415
 
-    if slack_user_id in (mapping.joined_slack_user_ids or []):
-        return True
     mode = resolve_thread_join_mode(integration, mapping.mentioning_slack_user_id)
     if mode == ThreadJoinMode.ALLOW:
         return True
-    if mode == ThreadJoinMode.ASK:
+    approvals = SlackThreadJoin.objects.for_team(mapping.team_id).filter(mapping_id=mapping.id)
+    # A person's approval holds whatever the mode is now: a mode change applies to new people only.
+    if approvals.filter(slack_user_id=slack_user_id).exists():
+        return True
+    if mode == ThreadJoinMode.ASK_PER_THREAD and approvals.exists():
+        return True
+    if mode in (ThreadJoinMode.ASK_PER_PERSON, ThreadJoinMode.ASK_PER_THREAD):
         post_thread_join_prompt(
             slack,
             integration,
             inputs,
             owner_slack_user_id=mapping.mentioning_slack_user_id,
             joiner_slack_user_id=slack_user_id,
+            opens_thread=mode == ThreadJoinMode.ASK_PER_THREAD,
         )
     logger.info(
         "slack_app_followup_thread_join_held",

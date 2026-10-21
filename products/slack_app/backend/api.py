@@ -12,7 +12,6 @@ from urllib.parse import urlparse, urlunparse
 from django.conf import settings
 from django.core import signing
 from django.core.cache import cache
-from django.db import transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -61,6 +60,7 @@ from products.slack_app.backend.models import (
     ChannelWelcomeMode,
     SlackChannel,
     SlackSettings,
+    SlackThreadJoin,
     SlackThreadTaskMapping,
     UntaggedFollowupMode,
 )
@@ -4180,8 +4180,11 @@ def post_thread_join_prompt(
     *,
     owner_slack_user_id: str,
     joiner_slack_user_id: str,
+    opens_thread: bool = False,
 ) -> bool:
     """Ask the thread creator whether someone else may join their thread.
+
+    ``opens_thread`` says that approving lets anyone join the thread, not only this person.
 
     The whole event is stashed behind a one-off token, so letting them join sends the original
     message rather than a reconstruction of it. The person who asked hears that the creator was
@@ -4218,7 +4221,8 @@ def post_thread_join_prompt(
             "block_id": f"{THREAD_JOIN_BLOCK_ID_PREFIX}:{context_token}",
             "text": {
                 "type": "mrkdwn",
-                "text": f"<@{joiner_slack_user_id}> wants to work with me in your thread. Let them join?",
+                "text": f"<@{joiner_slack_user_id}> wants to work with me in your thread. "
+                + ("Let anyone join this thread?" if opens_thread else "Let them join?"),
             },
         },
         {
@@ -4229,7 +4233,7 @@ def post_thread_join_prompt(
                     "type": "button",
                     "action_id": THREAD_JOIN_ACTION_ALLOW,
                     "style": "primary",
-                    "text": {"type": "plain_text", "text": "Let them join"},
+                    "text": {"type": "plain_text", "text": "Let anyone join" if opens_thread else "Let them join"},
                     "value": context_token,
                 },
                 {
@@ -4246,7 +4250,7 @@ def post_thread_join_prompt(
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "If this task runs on your ChatGPT plan, their messages use your plan too. "
+                        "If this task runs on your ChatGPT plan, messages from people who join use your plan too. "
                         f"In the {home_tab_label} you can choose who joins your threads."
                     ),
                 }
@@ -4326,23 +4330,24 @@ def _handle_thread_join_allow(payload: dict) -> HttpResponse:
         _delete_ephemeral_via_response_url(response_url)
         return HttpResponse(status=200)
 
-    with transaction.atomic():
-        mapping = (
-            SlackThreadTaskMapping.objects.select_for_update()
-            .filter(
-                integration_id=integration.id,
-                channel=context.get("slack_channel_id"),
-                thread_ts=context.get("thread_ts"),
-            )
-            .first()
+    mapping = (
+        SlackThreadTaskMapping.objects.filter(
+            integration_id=integration.id,
+            channel=context.get("slack_channel_id"),
+            thread_ts=context.get("thread_ts"),
         )
-        if mapping is None:
-            _delete_ephemeral_via_response_url(response_url)
-            return HttpResponse(status=200)
-        joined = list(mapping.joined_slack_user_ids or [])
-        if joiner_slack_user_id not in joined:
-            mapping.joined_slack_user_ids = [*joined, joiner_slack_user_id]
-            mapping.save(update_fields=["joined_slack_user_ids", "updated_at"])
+        .only("id", "team_id")
+        .first()
+    )
+    if mapping is None:
+        _delete_ephemeral_via_response_url(response_url)
+        return HttpResponse(status=200)
+    # The unique constraint makes a double click or a retry a no-op.
+    SlackThreadJoin.objects.for_team(mapping.team_id).get_or_create(
+        mapping=mapping,
+        slack_user_id=joiner_slack_user_id,
+        defaults={"team_id": mapping.team_id, "allowed_by_slack_user_id": context["owner_slack_user_id"]},
+    )
 
     cache.delete(_picker_context_cache_key(context_token))
     _start_mention_workflow(

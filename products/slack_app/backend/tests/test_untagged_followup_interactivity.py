@@ -29,7 +29,12 @@ from products.slack_app.backend.api import (
     UNTAGGED_QUESTION_CONTEXT_KIND,
     _picker_context_cache_key,
 )
-from products.slack_app.backend.models import SlackSettings, SlackThreadTaskMapping, UntaggedFollowupMode
+from products.slack_app.backend.models import (
+    SlackSettings,
+    SlackThreadJoin,
+    SlackThreadTaskMapping,
+    UntaggedFollowupMode,
+)
 from products.slack_app.backend.tests.helpers import sign_slack_request
 
 
@@ -292,8 +297,12 @@ class TestUntaggedFollowupInteractivity(TestCase):
             response = self._click(THREAD_JOIN_ACTION_ALLOW, clicker)
 
         assert response.status_code == 200
-        self.mapping.refresh_from_db()
-        assert self.mapping.joined_slack_user_ids == (["U_BOB"] if joins else None)
+        joins_recorded = list(
+            SlackThreadJoin.objects.for_team(self.team.id)
+            .filter(mapping=self.mapping)
+            .values_list("slack_user_id", "allowed_by_slack_user_id")
+        )
+        assert joins_recorded == ([("U_BOB", "U_ALICE")] if joins else [])
         assert mock_start.called is joins
         if joins:
             assert mock_start.call_args.args[0] == self.event

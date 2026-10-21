@@ -16,7 +16,7 @@ from posthog.models.user import User
 from posthog.models.user_integration import UserIntegration
 
 from products.slack_app.backend.api import SlackUserContext
-from products.slack_app.backend.models import SlackSettings, SlackThreadTaskMapping, ThreadJoinMode
+from products.slack_app.backend.models import SlackSettings, SlackThreadJoin, SlackThreadTaskMapping, ThreadJoinMode
 from products.slack_app.backend.services.run_preferences import SLACK_DEFAULT_MODEL
 from products.slack_app.backend.services.slack_messages import (
     SlackFileRef,
@@ -1176,9 +1176,13 @@ class TestForwardPostHogCodeFollowupActivity(TestCase):
     @parameterized.expand(
         [
             ("allow", ThreadJoinMode.ALLOW, None, True, False),
-            ("ask", ThreadJoinMode.ASK, None, False, True),
-            ("ask_already_joined", ThreadJoinMode.ASK, ["U_BOB"], True, False),
+            ("ask_per_person", ThreadJoinMode.ASK_PER_PERSON, None, False, True),
+            ("ask_per_person_already_joined", ThreadJoinMode.ASK_PER_PERSON, ["U_BOB"], True, False),
+            ("ask_per_person_after_someone_else_joined", ThreadJoinMode.ASK_PER_PERSON, ["U_CAROL"], False, True),
+            ("ask_per_thread", ThreadJoinMode.ASK_PER_THREAD, None, False, True),
+            ("ask_per_thread_after_someone_else_joined", ThreadJoinMode.ASK_PER_THREAD, ["U_CAROL"], True, False),
             ("never", ThreadJoinMode.NEVER, None, False, False),
+            ("never_after_joining", ThreadJoinMode.NEVER, ["U_BOB"], True, False),
         ]
     )
     @patch("products.slack_app.backend.api.post_thread_join_prompt")
@@ -1190,8 +1194,10 @@ class TestForwardPostHogCodeFollowupActivity(TestCase):
     ):
         SlackSettings.objects.create(slack_workspace_id="T_SLACK", slack_user_id="U_ALICE", thread_join_mode=mode)
         mapping = self._create_mapping(mentioning_user="U_ALICE")
-        mapping.joined_slack_user_ids = joined
-        mapping.save()
+        for slack_user_id in joined or []:
+            SlackThreadJoin.objects.for_team(self.team.id).create(
+                team=self.team, mapping=mapping, slack_user_id=slack_user_id, allowed_by_slack_user_id="U_ALICE"
+            )
         bob = User.objects.create(email="bob@test.com", first_name="Bob")
         mock_slack_cls.return_value = MagicMock()
         mock_resolve.return_value = SlackUserContext(user=bob, slack_email="bob@test.com")
@@ -1204,6 +1210,8 @@ class TestForwardPostHogCodeFollowupActivity(TestCase):
         assert result is True
         assert mock_signal.called is delivered
         assert mock_prompt.called is prompted
+        if prompted:
+            assert mock_prompt.call_args.kwargs["opens_thread"] is (mode == ThreadJoinMode.ASK_PER_THREAD)
         if delivered:
             # A run on the creator's plan takes the joiner's turn on that plan.
             assert mock_signal.call_args.kwargs["plan_owner_consented"] is True

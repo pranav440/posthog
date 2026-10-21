@@ -479,7 +479,7 @@ class TestRenderHomeView:
             channel_welcome_mode=ChannelWelcomeMode.CHANNEL,
             auto_model_choice=auto_model_choice,
             own_plan=OwnPlanState(connected=True),
-            thread_join_mode=ThreadJoinMode.ASK,
+            thread_join_mode=ThreadJoinMode.ASK_PER_THREAD,
         )
 
     def test_every_control_the_tab_renders_is_routable(self):
