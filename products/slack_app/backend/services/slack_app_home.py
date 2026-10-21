@@ -42,6 +42,7 @@ from products.slack_app.backend.models import (
     ChannelWelcomeMode,
     SlackSettings,
     SlackUserProfileCache,
+    ThreadJoinMode,
     UntaggedFollowupMode,
 )
 from products.slack_app.backend.services.integration_resolver import load_integrations, resolve_from_candidates
@@ -76,6 +77,7 @@ from products.slack_app.backend.services.slack_settings import (
     AIPreferences,
     resolve_auto_model_choice,
     resolve_channel_welcome_mode,
+    resolve_thread_join_mode,
     resolve_untagged_followup_mode,
     resolve_untagged_question_mode,
     set_auto_model_choice,
@@ -109,6 +111,7 @@ ACTION_STATS_WINDOW = "slack_app_home:stats_window"
 ACTION_STATS_REFRESH = "slack_app_home:stats_refresh"
 ACTION_SET_UNTAGGED_FOLLOWUP_MODE = "slack_app_home:set_untagged_followup_mode"
 ACTION_SET_UNTAGGED_QUESTION_MODE = "slack_app_home:set_untagged_question_mode"
+ACTION_SET_THREAD_JOIN_MODE = "slack_app_home:set_thread_join_mode"
 ACTION_SET_CHANNEL_WELCOME_MODE = "slack_app_home:set_channel_welcome_mode"
 ACTION_SET_AUTO_MODEL_CHOICE = "slack_app_home:set_auto_model_choice"
 # URL buttons: Slack opens the link itself and posts a block_actions payload we
@@ -137,6 +140,7 @@ HOME_ACTION_IDS: frozenset[str] = frozenset(
         ACTION_STATS_REFRESH,
         ACTION_SET_UNTAGGED_FOLLOWUP_MODE,
         ACTION_SET_UNTAGGED_QUESTION_MODE,
+        ACTION_SET_THREAD_JOIN_MODE,
         ACTION_SET_CHANNEL_WELCOME_MODE,
         ACTION_SET_AUTO_MODEL_CHOICE,
         ACTION_GITHUB_SETTINGS,
@@ -462,6 +466,7 @@ def render_home_view(
     channel_welcome_mode: ChannelWelcomeMode | None = None,
     auto_model_choice: bool | None = None,
     own_plan: OwnPlanState | None = None,
+    thread_join_mode: ThreadJoinMode | None = None,
     has_project_access: bool = True,
     account_settings_url: str | None = None,
 ) -> dict:
@@ -504,6 +509,8 @@ def render_home_view(
         blocks.extend(_auto_model_choice_blocks(auto_model_choice))
     if own_plan is not None:
         blocks.extend(_own_plan_blocks(own_plan))
+    if thread_join_mode is not None:
+        blocks.extend(_thread_join_blocks(thread_join_mode, uses_own_plan=bool(own_plan and own_plan.connected)))
 
     # Section 4 — thread follow-ups: whether replies other people leave in the
     # threads you started reach PostHog on their own.
@@ -973,7 +980,7 @@ def _auto_model_choice_blocks(enabled: bool) -> list[dict]:
 
 def _own_plan_blocks(state: OwnPlanState) -> list[dict]:
     if state.connected:
-        text = "Codex tasks you start here use your ChatGPT plan. While one runs, only you can send it messages."
+        text = "Codex tasks you start here use your ChatGPT plan, also when other people join your thread."
     else:
         connect = (
             f"<{state.settings_url}|Connect your ChatGPT plan>" if state.settings_url else "Connect your ChatGPT plan"
@@ -1052,6 +1059,30 @@ def _untagged_questions_section_blocks(mode: UntaggedFollowupMode) -> list[dict]
         ),
         note="Only your own questions. Thread follow-ups keep the setting above.",
     )
+
+
+def _thread_join_blocks(mode: ThreadJoinMode, *, uses_own_plan: bool) -> list[dict]:
+    """Picker for what happens when someone else tags PostHog in a thread you started."""
+    options = [
+        {"text": {"type": "plain_text", "text": label, "emoji": True}, "value": value}
+        for value, label in ThreadJoinMode.choices
+    ]
+    select: dict[str, Any] = {
+        "type": "static_select",
+        "action_id": ACTION_SET_THREAD_JOIN_MODE,
+        "options": options,
+        "initial_option": next(o for o in options if o["value"] == mode.value),
+    }
+    note = (
+        "Tasks in your threads use your ChatGPT plan, so people who join use your plan too."
+        if uses_own_plan
+        else "When you use your ChatGPT plan, people who join your threads use your plan too."
+    )
+    return [
+        _subsection_label("People who join your threads"),
+        {"type": "actions", "elements": [select]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": note}]},
+    ]
 
 
 CHANNEL_WELCOME_MODE_LABELS: dict[str, str] = {
@@ -1768,6 +1799,18 @@ def handle_ai_preferences_block_action(payload: dict, action: dict) -> HttpRespo
         republish()
         return HttpResponse(status=200)
 
+    if action_id == ACTION_SET_THREAD_JOIN_MODE:
+        picked = (action.get("selected_option") or {}).get("value")
+        if picked in ThreadJoinMode.values:
+            SlackSettings.objects.update_or_create(
+                slack_workspace_id=integration.integration_id,
+                slack_user_id=slack_user_id,
+                defaults={"thread_join_mode": picked},
+            )
+            capture_slack_event(integration, "slack app thread join mode set", slack_user_id=slack_user_id, mode=picked)
+        republish()
+        return HttpResponse(status=200)
+
     if action_id == ACTION_SET_UNTAGGED_FOLLOWUP_MODE:
         if (mode := _picked_untagged_mode(action)) is not None:
             set_untagged_followup_mode(integration.integration_id, slack_user_id, mode)
@@ -2166,7 +2209,12 @@ def _clear_project_personal(integration: Integration, slack_user_id: str) -> Non
     ).first()
     if row is None:
         return
-    if not row.untagged_followup_mode and not row.untagged_question_mode and not row.auto_model_choice:
+    if (
+        not row.untagged_followup_mode
+        and not row.untagged_question_mode
+        and not row.auto_model_choice
+        and not row.thread_join_mode
+    ):
         row.delete()
         return
     row.default_integration = None
@@ -2213,6 +2261,7 @@ def _build_home_view(
     )
     # Resolved once: the auto model choice card and the plan card both need it.
     home_user = _resolve_home_user(integration, slack_user_id)
+    own_plan = _resolve_own_plan_state(integration, slack_user_id, home_user, accessible=accessible)
     stats_state = _resolve_stats_state(
         integration,
         accessible=accessible,
@@ -2238,7 +2287,9 @@ def _build_home_view(
         auto_model_choice=(
             resolve_auto_model_choice(integration.integration_id, slack_user_id) if home_user is not None else None
         ),
-        own_plan=_resolve_own_plan_state(integration, slack_user_id, home_user, accessible=accessible),
+        own_plan=own_plan,
+        # Shown with the plan card, because letting people join is what spends the creator's plan.
+        thread_join_mode=resolve_thread_join_mode(integration, slack_user_id) if own_plan is not None else None,
         has_project_access=bool(accessible),
         # The same settings page the GitHub card deep-links to.
         account_settings_url=github_state.settings_url,

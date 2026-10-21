@@ -53,6 +53,8 @@ class SlackThreadTaskMapping(UUIDModel):
     # thread down to whoever opened it, which would leave the agent's links dead for everyone
     # else reading along.
     conversation_type = models.CharField(max_length=16, choices=ConversationType, null=True, blank=True)
+    # Slack user ids the thread creator let join under the ``ask`` join mode. NULL means nobody yet.
+    joined_slack_user_ids = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -126,6 +128,17 @@ class UntaggedFollowupMode(models.TextChoices):
     NEVER = "never", "Never pick it up"
 
 
+class ThreadJoinMode(models.TextChoices):
+    """What PostHog does when someone else tags it in a thread a user started.
+
+    Read from the thread creator's settings row. An unset row resolves to ``ALLOW``.
+    """
+
+    ALLOW = "allow", "Let them join"
+    ASK = "ask", "Ask me first"
+    NEVER = "never", "Ignore them"
+
+
 class ChannelWelcomeMode(models.TextChoices):
     """Where the greeting goes when someone adds the app to a channel.
 
@@ -190,6 +203,14 @@ class SlackSettings(UUIDModel):
         blank=True,
         choices=UntaggedFollowupMode.choices,
         help_text="What PostHog does with this user's top-level channel questions that do not tag the app.",
+    )
+    # NULL means the user has never picked, which resolves to ``ALLOW``.
+    thread_join_mode = models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        choices=ThreadJoinMode.choices,
+        help_text="What PostHog does when someone else tags it in threads this user started.",
     )
     # Only read on the workspace-wide row. NULL resolves to ``CHANNEL``.
     channel_welcome_mode = models.CharField(

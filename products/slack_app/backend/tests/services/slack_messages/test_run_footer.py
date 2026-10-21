@@ -5,12 +5,15 @@ from uuid import uuid4
 import pytest
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.apps import apps
+from django.test import SimpleTestCase, TestCase
 
 from parameterized import parameterized
 
+from posthog.models import Organization, Team, User
 from posthog.models.integration import Integration
 
+from products.slack_app.backend.models import SlackThreadTaskMapping, SlackUserProfileCache
 from products.slack_app.backend.services.slack_messages import (
     RunFooter,
     load_run_footer,
@@ -137,6 +140,44 @@ class TestLoadRunFooter(SimpleTestCase):
     @patch("products.tasks.backend.facade.api.get_task_run", side_effect=RuntimeError("db down"))
     def test_a_failure_to_describe_the_run_costs_the_footer_not_the_answer(self, _mock_get_run) -> None:
         assert load_run_footer("run-1", integration_id=None) == RunFooter()
+
+
+class TestLoadRunFooterJoinedThread(TestCase):
+    @patch("products.tasks.backend.facade.api.get_task_run")
+    def test_a_joiners_reply_names_the_creator_whose_plan_pays(self, mock_get_run) -> None:
+        team = Team.objects.create(organization=Organization.objects.create(name="org"), name="team")
+        creator = User.objects.create(email="creator@example.com")
+        integration = Integration.objects.create(team=team, kind="slack", integration_id="T1", config={})
+        Task = apps.get_model("tasks", "Task")
+        task = Task.objects.create(
+            team=team, title="t", description="d", origin_product=Task.OriginProduct.SLACK, created_by=creator
+        )
+        SlackThreadTaskMapping.objects.create(
+            team=team,
+            integration=integration,
+            slack_workspace_id="T1",
+            channel="C1",
+            thread_ts="1.0",
+            task=task,
+            task_run=apps.get_model("tasks", "TaskRun").objects.create(task=task, team=team),
+            mentioning_slack_user_id="U_CREATOR",
+        )
+        SlackUserProfileCache.objects.create(integration=integration, slack_user_id="U_CREATOR", display_name="vojta")
+        mock_get_run.return_value = SimpleNamespace(
+            id=uuid4(),
+            task_id=task.id,
+            team_id=team.id,
+            created_by_id=None,
+            state={
+                "runtime_adapter": "codex",
+                "codex_model_access": "own-subscription",
+                "codex_subscription_user_id": creator.id,
+                "slack_actor_user_id": creator.id + 1,
+            },
+        )
+
+        # Plain text, because a real mention would notify the creator under every reply.
+        assert load_run_footer("run-1", integration_id=integration.id).plan == "@vojta's ChatGPT plan"
 
 
 class TestViewerHasCodeAccess(SimpleTestCase):

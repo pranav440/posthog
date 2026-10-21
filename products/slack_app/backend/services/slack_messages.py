@@ -766,12 +766,14 @@ def _project_name(team_id: int, *, integration_id: int | None, created_by_id: in
     return team.name if team else None
 
 
-def _plan_label(state: dict[str, Any] | None) -> str | None:
-    """The plan that pays for the run, or `None` on PostHog credits.
+def _plan_label(state: dict[str, Any] | None, *, task_id: Any, integration_id: int | None) -> str | None:
+    """Whose plan pays for the run, or `None` on PostHog credits.
 
-    Only the plan owner can send turns to a run on their plan, so the turn this reply answers
-    is normally theirs.
+    The person who sent the turn reads "Your". When someone who joined the thread sent it, the
+    reply names the thread creator as plain text, because a real mention would notify the
+    creator under every reply.
     """
+    from products.slack_app.backend.models import SlackThreadTaskMapping, SlackUserProfileCache  # noqa: PLC0415
     from products.tasks.backend.facade.api import get_run_plan  # noqa: PLC0415
 
     plan = get_run_plan(state)
@@ -779,7 +781,22 @@ def _plan_label(state: dict[str, Any] | None) -> str | None:
         return None
     if plan.owner_user_id is not None and plan.owner_user_id == (state or {}).get("slack_actor_user_id"):
         return f"Your {plan.plan_name}"
-    return plan.plan_name
+    if integration_id is None:
+        return plan.plan_name
+    owner_slack_user_id = (
+        SlackThreadTaskMapping.objects.filter(integration_id=integration_id, task_id=task_id)
+        .values_list("mentioning_slack_user_id", flat=True)
+        .first()
+    )
+    profile = (
+        SlackUserProfileCache.objects.filter(integration_id=integration_id, slack_user_id=owner_slack_user_id)
+        .only("display_name", "real_name")
+        .first()
+        if owner_slack_user_id
+        else None
+    )
+    name = (profile.display_name or profile.real_name) if profile is not None else None
+    return f"@{escape_slack_mrkdwn(name)}'s {plan.plan_name}" if name else plan.plan_name
 
 
 def load_run_footer(run_id: str | UUID | None, *, integration_id: int | None) -> RunFooter:
@@ -818,7 +835,7 @@ def load_run_footer(run_id: str | UUID | None, *, integration_id: int | None) ->
                 integration_id=integration_id,
                 created_by_id=run.created_by_id,
             ),
-            plan=_plan_label(run.state),
+            plan=_plan_label(run.state, task_id=run.task_id, integration_id=integration_id),
         )
     except Exception:
         logger.exception("slack_app_run_footer_load_failed", run_id=str(run_id))

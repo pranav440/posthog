@@ -16,7 +16,7 @@ from posthog.models.user import User
 from posthog.models.user_integration import UserIntegration
 
 from products.slack_app.backend.api import SlackUserContext
-from products.slack_app.backend.models import SlackThreadTaskMapping
+from products.slack_app.backend.models import SlackSettings, SlackThreadTaskMapping, ThreadJoinMode
 from products.slack_app.backend.services.run_preferences import SLACK_DEFAULT_MODEL
 from products.slack_app.backend.services.slack_messages import (
     SlackFileRef,
@@ -1173,48 +1173,79 @@ class TestForwardPostHogCodeFollowupActivity(TestCase):
         assert signal_kwargs["actor_user_id"] == bob.id
         assert signal_kwargs["message_id"] is not None
 
-    @parameterized.expand([("owner", "U_ALICE", True), ("someone_else", "U_BOB", False)])
+    @parameterized.expand(
+        [
+            ("allow", ThreadJoinMode.ALLOW, None, True, False),
+            ("ask", ThreadJoinMode.ASK, None, False, True),
+            ("ask_already_joined", ThreadJoinMode.ASK, ["U_BOB"], True, False),
+            ("never", ThreadJoinMode.NEVER, None, False, False),
+        ]
+    )
+    @patch("products.slack_app.backend.api.post_thread_join_prompt")
     @patch("products.tasks.backend.facade.api.signal_task_run_user_message", return_value=True)
     @patch("products.slack_app.backend.api.resolve_slack_user")
     @patch("posthog.models.integration.SlackIntegration")
-    def test_only_the_plan_owner_can_message_a_run_on_their_plan(
-        self, _name, slack_user_id, delivered, mock_slack_cls, mock_resolve, mock_signal
+    def test_the_thread_creators_join_mode_decides_who_reaches_the_task(
+        self, _name, mode, joined, delivered, prompted, mock_slack_cls, mock_resolve, mock_signal, mock_prompt
     ):
-        self.task_run.state = {
-            **self.task_run.state,
-            "runtime_adapter": "codex",
-            "codex_model_access": "own-subscription",
-            "codex_subscription_user_id": self.user.id,
-            "slack_actor_user_id": self.user.id,
-            "slack_actor_slack_user_id": "U_ALICE",
-        }
-        self.task_run.save()
-        self._create_mapping(mentioning_user="U_ALICE")
+        SlackSettings.objects.create(slack_workspace_id="T_SLACK", slack_user_id="U_ALICE", thread_join_mode=mode)
+        mapping = self._create_mapping(mentioning_user="U_ALICE")
+        mapping.joined_slack_user_ids = joined
+        mapping.save()
         bob = User.objects.create(email="bob@test.com", first_name="Bob")
-        mock_slack_instance = MagicMock()
-        mock_slack_cls.return_value = mock_slack_instance
+        mock_slack_cls.return_value = MagicMock()
         mock_resolve.return_value = SlackUserContext(user=bob, slack_email="bob@test.com")
 
         inputs = _make_inputs(self.integration.id, self.user.id)
         result = forward_posthog_code_followup_activity(
-            inputs, "C123", "1234.5678", slack_user_id, "<@BOT> ship it", "1234.5679"
+            inputs, "C123", "1234.5678", "U_BOB", "<@BOT> ship it", "1234.5679"
         )
 
         assert result is True
         assert mock_signal.called is delivered
-        refusals = [
-            call.kwargs["text"]
-            for call in mock_slack_instance.client.chat_postMessage.call_args_list
-            if "ChatGPT plan" in call.kwargs.get("text", "")
-        ]
-        assert refusals == (
-            []
-            if delivered
-            else [
-                "This task is running on <@U_ALICE>'s ChatGPT plan, so only they can send it messages "
-                "while it runs. To work on it yourself, start a new thread."
-            ]
-        )
+        assert mock_prompt.called is prompted
+        if delivered:
+            # A run on the creator's plan takes the joiner's turn on that plan.
+            assert mock_signal.call_args.kwargs["plan_owner_consented"] is True
+
+    @patch("products.tasks.backend.facade.temporal.dispatch_task_processing_workflow")
+    @patch("products.slack_app.backend.api.resolve_slack_user")
+    @patch("posthog.models.integration.SlackIntegration")
+    def test_a_joiner_resumes_the_task_on_the_thread_creators_plan(
+        self, mock_slack_cls, mock_resolve, mock_execute_workflow
+    ):
+        self.task_run.status = self.TaskRun.Status.COMPLETED
+        self.task_run.save()
+        self._create_mapping(mentioning_user="U_ALICE")
+        bob = User.objects.create(email="bob@test.com", first_name="Bob")
+        mock_slack_cls.return_value = MagicMock()
+        mock_resolve.return_value = SlackUserContext(user=bob, slack_email="bob@test.com")
+        codex_run = {"runtime_adapter": "codex", "model": "gpt-5.5", "provider": "openai"}
+
+        with (
+            patch(
+                "products.slack_app.backend.temporal.activities.task_creation._run_preference_state",
+                return_value=codex_run,
+            ),
+            patch(
+                "products.tasks.backend.facade.api.unattended_model_access_state",
+                side_effect=lambda user, **_: {"codex_model_access": "own-subscription"} if user == self.user else {},
+            ),
+            patch("products.slack_app.backend.feature_flags.is_slack_app_byos_enabled", return_value=True),
+        ):
+            forward_posthog_code_followup_activity(
+                inputs=_make_inputs(self.integration.id, self.user.id),
+                channel="C123",
+                thread_ts="1234.5678",
+                slack_user_id="U_BOB",
+                event_text="<@BOT> fix the tests",
+                user_message_ts="1234.5679",
+            )
+
+        new_run = self.TaskRun.objects.get(id=mock_execute_workflow.call_args.kwargs["run_id"])
+        assert new_run.state["codex_model_access"] == "own-subscription"
+        assert new_run.state["codex_subscription_user_id"] == self.user.id
+        assert new_run.state["slack_actor_user_id"] == bob.id
 
     @patch("products.slack_app.backend.api.resolve_slack_user", return_value=None)
     @patch("posthog.models.integration.SlackIntegration")

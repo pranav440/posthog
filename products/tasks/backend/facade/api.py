@@ -247,7 +247,6 @@ __all__ = [
     "ensure_task_run_session",
     "ensure_subscription_owner",
     "get_run_plan",
-    "plan_refused_to",
     "unattended_plan_status",
     "unattended_model_access_state",
     "beacon_task_presence",
@@ -2217,14 +2216,22 @@ def create_run(
     extra_state: dict | None = None,
     branch: str | None = None,
     acting_user_id: int | None = None,
+    subscription_owner_id: int | None = None,
 ) -> contracts.TaskRunDTO:
     """Create a new run for an existing task (e.g. resuming an interactive sandbox session).
 
     ``acting_user_id`` attributes the run to the user whose AI run preferences should apply
     when ``extra_state`` pins no runtime selection; it falls back to the task's creator.
+    ``subscription_owner_id`` names whose plan the run bills to, when that is not the acting user.
     """
     task = Task.objects.get(id=task_id)
-    run = task.create_run(mode=mode, extra_state=extra_state, branch=branch, acting_user_id=acting_user_id)
+    run = task.create_run(
+        mode=mode,
+        extra_state=extra_state,
+        branch=branch,
+        acting_user_id=acting_user_id,
+        subscription_owner_id=subscription_owner_id,
+    )
     return _task_run_to_dto(run, task=task)
 
 
@@ -4089,25 +4096,15 @@ def unattended_model_access_state(user: User, *, organization_id: str, runtime_a
     )
 
 
-def plan_refused_to(state: dict[str, Any] | None, actor_user_id: int | None) -> str | None:
-    """The name of the plan the actor may not use on this run, or `None` when they may send it messages.
-
-    A run on PostHog credits allows everyone; a run on a user's plan allows only that user.
-    """
+def ensure_subscription_owner(state: dict[str, Any] | None, actor_user_id: int | None) -> None:
+    """Refuse anyone but the owner of the plan a run bills to. A run on PostHog credits allows everyone."""
     run_state = state or {}
     for adapter, plan_name in SUBSCRIPTION_PLAN_NAMES.items():
         if (
             run_state.get(f"{adapter}_model_access") == "own-subscription"
             and run_state.get(f"{adapter}_subscription_user_id") != actor_user_id
         ):
-            return plan_name
-    return None
-
-
-def ensure_subscription_owner(state: dict[str, Any] | None, actor_user_id: int | None) -> None:
-    """Refuse anyone but the owner of the plan a run bills to. A run on PostHog credits allows everyone."""
-    if plan_name := plan_refused_to(state, actor_user_id):
-        raise PermissionDenied(f"Only the user who started this run can use its {plan_name}.")
+            raise PermissionDenied(f"Only the user who started this run can use its {plan_name}.")
 
 
 def validate_task_run_sandbox_token(
@@ -5618,8 +5615,13 @@ def signal_task_run_user_message(
     steer: bool = False,
     rpc_timeout: timedelta | None = None,
     workflow_id: str | None = None,
+    plan_owner_consented: bool = False,
 ) -> bool | None:
     """Queue a user_message follow-up signal on the run's workflow.
+
+    ``plan_owner_consented`` lets someone other than the plan owner message a run on the owner's
+    plan. Only a caller that collected the owner's consent may set it, such as the Slack app,
+    where the thread creator chooses who may join their threads.
 
     Returns ``True`` on success, ``False`` when the target workflow is gone
     (completed or evicted — a terminal outcome), ``None`` when the run isn't
@@ -5639,7 +5641,8 @@ def signal_task_run_user_message(
     run = _get_visible_run(run_id, task_id, team_id)
     if run is None:
         return None
-    ensure_subscription_owner(run.state, actor_user_id)
+    if not plan_owner_consented:
+        ensure_subscription_owner(run.state, actor_user_id)
     if run.is_terminal or (run.state or {}).get("cancel_requested_at"):
         if not run.is_terminal:
             raise RuntimeError("Task run is still stopping. Try again shortly.")

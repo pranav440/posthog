@@ -1006,6 +1006,8 @@ def forward_posthog_code_followup_activity(
             actor=slack_user_id,
             actor_user_id=resolved.user.id,
         )
+        if not _may_join_thread(slack, integration, inputs, mapping, slack_user_id, channel, thread_ts):
+            return True
 
     if block_if_team_over_quota(
         integration=integration,
@@ -1040,25 +1042,6 @@ def forward_posthog_code_followup_activity(
         )
         clear_open_suggestions(slack.client, integration.id, channel, thread_ts)
         return handled
-
-    refused_plan = tasks_facade.plan_refused_to(task_run.state, actor_user.id if actor_user else None)
-    if refused_plan is not None:
-        # The live sandbox holds the owner's plan token, and the facade refuses anyone else's
-        # message at delivery. Refuse here, before attachment uploads, and say why.
-        _post_owner_plan_refusal(
-            slack,
-            channel,
-            thread_ts,
-            plan_name=refused_plan,
-            owner_slack_user_id=(task_run.state or {}).get("slack_actor_slack_user_id"),
-        )
-        logger.info(
-            "slack_app_followup_refused_owner_plan",
-            channel=channel,
-            thread_ts=thread_ts,
-            task_run_id=str(task_run.id),
-        )
-        return True
 
     from products.slack_app.backend.services.slack_messages import (  # noqa: PLC0415
         collect_thread_messages,
@@ -1173,6 +1156,9 @@ def forward_posthog_code_followup_activity(
         message_id=_slack_followup_message_id(channel, user_message_ts, thread_ts),
         actor_slack_user_id=slack_user_id,
         person_message=person_message,
+        # `_may_join_thread` above applied the thread creator's choice about who may join, and a
+        # run on a plan bills the creator's plan whoever sends the turn.
+        plan_owner_consented=True,
     )
     if signal_result is not True:
         logger.warning(
@@ -1232,19 +1218,45 @@ def forward_posthog_code_followup_activity(
     return True
 
 
-def _post_owner_plan_refusal(
-    slack: Any, channel: str, thread_ts: str, *, plan_name: str, owner_slack_user_id: str | None
-) -> None:
-    owner = f"<@{owner_slack_user_id}>'s" if owner_slack_user_id else "its owner's"
-    post_slack_thread_reply(
-        slack.client,
+def _may_join_thread(
+    slack: Any,
+    integration: Any,
+    inputs: PostHogCodeSlackMentionWorkflowInputs,
+    mapping: Any,
+    slack_user_id: str,
+    channel: str,
+    thread_ts: str,
+) -> bool:
+    """Whether someone other than the thread creator may send this message to the thread's task.
+
+    The creator's join mode decides. Under ``ask`` the creator gets a prompt, and the message is
+    sent again once they let this person join.
+    """
+    from products.slack_app.backend.api import post_thread_join_prompt  # noqa: PLC0415
+    from products.slack_app.backend.models import ThreadJoinMode  # noqa: PLC0415
+    from products.slack_app.backend.services.slack_settings import resolve_thread_join_mode  # noqa: PLC0415
+
+    if slack_user_id in (mapping.joined_slack_user_ids or []):
+        return True
+    mode = resolve_thread_join_mode(integration, mapping.mentioning_slack_user_id)
+    if mode == ThreadJoinMode.ALLOW:
+        return True
+    if mode == ThreadJoinMode.ASK:
+        post_thread_join_prompt(
+            slack,
+            integration,
+            inputs,
+            owner_slack_user_id=mapping.mentioning_slack_user_id,
+            joiner_slack_user_id=slack_user_id,
+        )
+    logger.info(
+        "slack_app_followup_thread_join_held",
         channel=channel,
         thread_ts=thread_ts,
-        text=(
-            f"This task is running on {owner} {plan_name}, so only they can send it messages while it runs. "
-            "To work on it yourself, start a new thread."
-        ),
+        mode=mode.value,
+        actor=slack_user_id,
     )
+    return False
 
 
 def _apply_followup_model_override(
@@ -1513,8 +1525,9 @@ def _resume_task_with_new_run(
     # carried over, like the keys above: a preference changed since the previous run is
     # picked up too.
     extra_state.update(_run_preference_state(model_override, team_id=mapping.task.team_id, user_id=run_actor.id))
-    # The replying user's own plan, never the plan of the run this one continues.
-    extra_state.update(_own_plan_state(integration, run_actor, runtime_adapter=extra_state.get("runtime_adapter")))
+    # The thread creator's plan, whoever replies: the creator chose who may join their thread.
+    own_plan_state = _own_plan_state(integration, created_by, runtime_adapter=extra_state.get("runtime_adapter"))
+    extra_state.update(own_plan_state)
 
     extra_state.update(tasks_facade.get_resume_snapshot_carry_state(previous_state))
     extra_state["resume_from_run_id"] = str(previous_run.id)
@@ -1548,7 +1561,11 @@ def _resume_task_with_new_run(
         # its gated-model entitlement check inside `create_run` must run against whoever
         # launches this follow-up.
         new_run = tasks_facade.create_run(
-            mapping.task_id, mode="interactive", extra_state=extra_state, acting_user_id=run_actor.id
+            mapping.task_id,
+            mode="interactive",
+            extra_state=extra_state,
+            acting_user_id=run_actor.id,
+            subscription_owner_id=created_by.id if own_plan_state else None,
         )
     except Exception:
         logger.exception(

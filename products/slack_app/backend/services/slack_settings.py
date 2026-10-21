@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from products.slack_app.backend.models import ChannelWelcomeMode, UntaggedFollowupMode
+from products.slack_app.backend.models import ChannelWelcomeMode, ThreadJoinMode, UntaggedFollowupMode
 
 if TYPE_CHECKING:
     from posthog.models.integration import Integration
@@ -92,6 +92,29 @@ def _set_untagged_mode(slack_workspace_id: str, slack_user_id: str, column: str,
     )
 
 
+def resolve_thread_join_mode(integration: Integration, slack_user_id: str | None) -> ThreadJoinMode:
+    """Resolve what happens when someone else tags PostHog in a thread this Slack user started.
+
+    An absent row or empty column resolves to `ALLOW`, so threads stay open as they always were.
+    An unknown value resolves to `NEVER`.
+    """
+    if not slack_user_id:
+        return ThreadJoinMode.ALLOW
+
+    from products.slack_app.backend.models import SlackSettings
+
+    stored = (
+        SlackSettings.objects.filter(slack_workspace_id=integration.integration_id, slack_user_id=slack_user_id)
+        .values_list("thread_join_mode", flat=True)
+        .first()
+    )
+    if stored is None:
+        return ThreadJoinMode.ALLOW
+    if stored in ThreadJoinMode.values:
+        return ThreadJoinMode(stored)
+    return ThreadJoinMode.NEVER
+
+
 def resolve_channel_welcome_mode(slack_workspace_id: str) -> ChannelWelcomeMode:
     """Resolve where the greeting goes when someone adds the app to a channel.
 
@@ -158,5 +181,6 @@ __all__ = [
     "set_untagged_followup_mode",
     "set_untagged_question_mode",
     "set_channel_welcome_mode",
+    "resolve_thread_join_mode",
     "resolve_untagged_followup_mode",
 ]
