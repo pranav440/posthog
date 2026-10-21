@@ -80,6 +80,9 @@ from products.warehouse_sources.backend.models.table import SELF_MANAGED_MIGRATI
 from products.warehouse_sources.backend.presentation.views.external_data_source.helpers import (
     source_feature_flag_missing,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.csv_types import (
+    UnsupportedCsvColumnError,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.self_managed import (
     SelfManagedCredential,
     SelfManagedLocation,
@@ -87,6 +90,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.obj
     UnmappableTableError,
     needs_preserved_column_names,
     parse_self_managed_url,
+    refuse_nested_columns,
     table_definition_for,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.object_store.settings import (
@@ -330,11 +334,17 @@ class _Planner:
         upload = UploadedFile(location=upload_for_migration(table, hosted), file_format=file_format)
         columns = table.columns or {}
         read_settings = UploadReadSettings(columns=columns, allow_double_quotes=table.csv_allow_double_quotes)
+        try:
+            # The import stores arrays and tuples as text, so adopting the table would break queries on them.
+            refuse_nested_columns(columns)
+            schema_metadata = upload_schema_metadata(
+                table.name, upload, read_settings, needs_preserved_column_names(columns.keys())
+            )
+        except (UnmappableTableError, UnsupportedCsvColumnError) as e:
+            return str(e)
         return _TablePlan(
             source=source,
-            schema_metadata=upload_schema_metadata(
-                table.name, upload, read_settings, needs_preserved_column_names(columns.keys())
-            ),
+            schema_metadata=schema_metadata,
             job_inputs=upload_job_inputs(upload, table.name),
             group_key=f"upload/{table.pk}",
             description=f"Uploaded file for {table.name}"[:400],

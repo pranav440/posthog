@@ -615,6 +615,17 @@ class TestFileUploadSources(APIBaseTest):
         table.refresh_from_db()
         assert table.name == "orders"
 
+    def test_replacing_the_file_of_an_append_schema_switches_it_to_full_refresh(self) -> None:
+        table, schema = self._table_with_source()
+        ExternalDataSchema.objects.filter(pk=schema.pk).update(sync_type=ExternalDataSchema.SyncType.APPEND)
+        self.get_columns.return_value = dict(REPLACEMENT_COLUMNS)
+
+        response = self._replace(table)
+
+        assert response.status_code == status.HTTP_202_ACCEPTED, response.json()
+        schema.refresh_from_db()
+        assert schema.sync_type == ExternalDataSchema.SyncType.FULL_REFRESH
+
     @parameterized.expand(["missing_file", "unreadable_file", "sync_running", "not_a_file_upload_table"])
     def test_a_replacement_that_cannot_go_ahead_changes_nothing(self, case: str) -> None:
         table, schema = self._table_with_source()

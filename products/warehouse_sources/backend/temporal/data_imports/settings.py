@@ -48,7 +48,6 @@ WORKFLOWS = [
     CDCSlotCleanupWorkflow,
     DiscoverSchemasWorkflow,
     PostImportWorkflow,
-    cleanup_source_after_sync_activity,
 ]
 
 ACTIVITIES = [

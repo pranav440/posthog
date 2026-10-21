@@ -257,16 +257,16 @@ def replace_file_upload(schema: ExternalDataSchema, upload: UploadedFile, read_s
     The table keeps its row and its name. The old file is recorded as superseded and is deleted
     once a sync that started after this call completes (see `FileUploadSource.cleanup_after_sync`).
     """
-    latest_job = (
-        ExternalDataJob.objects.filter(team_id=schema.team_id, schema_id=schema.id).order_by("-created_at").first()
-    )
-    if latest_job is not None and latest_job.status == ExternalDataJobStatus.RUNNING:
-        raise FileUploadSourceError("A sync of this table is running. Replace the file once it finishes.")
-
     with transaction.atomic():
         source = lock_source(str(schema.source_id), schema.team_id)
         if source is None:
             raise FileUploadSourceError("This table's source was deleted.")
+        # Checked under the source's lock, so two replacements of one table can't both pass it.
+        latest_job = (
+            ExternalDataJob.objects.filter(team_id=schema.team_id, schema_id=schema.id).order_by("-created_at").first()
+        )
+        if latest_job is not None and latest_job.status == ExternalDataJobStatus.RUNNING:
+            raise FileUploadSourceError("A sync of this table is running. Replace the file once it finishes.")
         try:
             current: UploadLocation | None = upload_from_job_inputs(source.team_id, source.job_inputs)
         except InvalidUploadError:
@@ -290,6 +290,12 @@ def replace_file_upload(schema: ExternalDataSchema, upload: UploadedFile, read_s
             schema.team_id,
             updates={"schema_metadata": upload_schema_metadata(schema.name, upload, read_settings, preserve)},
         )
+        # A new file replaces the table's rows, so the sync must be a full refresh, never an append.
+        if schema.sync_type != ExternalDataSchema.SyncType.FULL_REFRESH:
+            schema.sync_type = ExternalDataSchema.SyncType.FULL_REFRESH
+            ExternalDataSchema.objects.filter(pk=schema.pk, team_id=schema.team_id).update(
+                sync_type=schema.sync_type, updated_at=timezone.now()
+            )
     schema.source = source
     return start_file_upload_sync(schema)
 

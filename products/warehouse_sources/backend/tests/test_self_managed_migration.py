@@ -915,6 +915,22 @@ class TestUploadedTableMigration(BaseTest):
         assert outcome.status.state == TableMigrationState.SKIPPED
         assert reason in (outcome.status.reason or "")
 
+    def test_an_uploaded_table_with_nested_columns_is_skipped(self) -> None:
+        table = self._table(
+            "orders", "file_uploads/team_{team}/{upload}/orders.parquet", DataWarehouseTableFormat.Parquet
+        )
+        table.columns = {
+            "tags": {"clickhouse": "Array(Nullable(String))", "hogql": "StringArrayDatabaseField", "valid": True}
+        }
+        table.save()
+
+        [outcome] = self._migrate()
+
+        assert outcome.status.state == TableMigrationState.SKIPPED
+        assert "'tags' is a Array" in (outcome.status.reason or "")
+        assert not ExternalDataSource.objects.filter(team=self.team).exists()
+        self.trigger.assert_not_called()
+
     def test_teams_without_the_flag_keep_their_uploaded_tables(self) -> None:
         self.flag_missing.return_value = True
         self._table("orders", "file_uploads/team_{team}/{upload}/orders.csv")

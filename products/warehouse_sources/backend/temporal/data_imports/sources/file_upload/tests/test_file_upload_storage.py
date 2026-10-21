@@ -141,3 +141,27 @@ class TestFileUploadStorage(BaseTest):
         source.save()
 
         assert delete_source_uploads(source) == []
+
+    def test_the_upload_the_source_reads_again_is_kept(self) -> None:
+        # A replacement pointed the source back at a file it had superseded.
+        entry = SupersededUpload(upload=self._upload(OLD_ID), superseded_at=SYNC_STARTED_AT - timedelta(minutes=1))
+        source = self._source(self._inputs(OLD_ID), entry)
+
+        assert release_superseded_uploads(str(source.pk), self.team.pk, SYNC_STARTED_AT) == []
+        self.s3.rm.assert_not_called()
+        source.refresh_from_db()
+        assert superseded_uploads(source) == []
+
+    def test_an_upload_storage_fails_to_delete_stays_recorded_for_the_next_sync(self) -> None:
+        self.s3.rm.side_effect = OSError("storage is down")
+        entry = SupersededUpload(upload=self._upload(OLD_ID), superseded_at=SYNC_STARTED_AT - timedelta(minutes=1))
+        source = self._source(self._inputs(CURRENT_ID), entry)
+
+        assert release_superseded_uploads(str(source.pk), self.team.pk, SYNC_STARTED_AT) == []
+        source.refresh_from_db()
+        assert superseded_uploads(source) == [entry]
+
+        self.s3.rm.side_effect = None
+        assert release_superseded_uploads(str(source.pk), self.team.pk, SYNC_STARTED_AT) == [entry.upload]
+        source.refresh_from_db()
+        assert superseded_uploads(source) == []

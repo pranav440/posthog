@@ -155,7 +155,7 @@ def needs_preserved_column_names(column_names: Iterable[str]) -> bool:
     return any(normalize_column_name(name) != name for name in column_names)
 
 
-def _refuse_nested_columns(columns: Mapping[str, Any] | None) -> None:
+def refuse_nested_columns(columns: Mapping[str, Any] | None) -> None:
     for name, clickhouse_type in stored_clickhouse_types(columns).items():
         base = clickhouse_base_type(clickhouse_type)
         if base in _NESTED_TYPES:
@@ -173,7 +173,7 @@ def table_definition_for(
 ) -> TableDefinition:
     """The schema contract that imports exactly the files the table's URL pattern reads."""
     file_format = source_format_for(table_format)
-    _refuse_nested_columns(columns)
+    refuse_nested_columns(columns)
     preserve = needs_preserved_column_names((columns or {}).keys())
     if file_format == "delta":
         path = location.key.strip("/")

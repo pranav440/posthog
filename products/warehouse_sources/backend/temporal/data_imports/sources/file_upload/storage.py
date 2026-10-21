@@ -135,8 +135,8 @@ def upload_in_use(
     return False
 
 
-def delete_upload_if_unused(upload: HostedUpload, exclude_source_id: str | None = None) -> bool:
-    """Best-effort delete. Returns whether the object was deleted."""
+def _delete_if_unused(upload: HostedUpload, exclude_source_id: str | None) -> bool | None:
+    """True when the object was deleted, False when it was kept or already gone, None when storage failed."""
     if not settings.DATAWAREHOUSE_BUCKET or upload_in_use(upload, exclude_source_id):
         return False
     try:
@@ -146,8 +146,13 @@ def delete_upload_if_unused(upload: HostedUpload, exclude_source_id: str | None 
     except Exception as e:
         capture_exception(e)
         logger.warning("Could not delete an uploaded file", team_id=upload.team_id, key=upload.key)
-        return False
+        return None
     return True
+
+
+def delete_upload_if_unused(upload: HostedUpload, exclude_source_id: str | None = None) -> bool:
+    """Best-effort delete. Returns whether the object was deleted."""
+    return _delete_if_unused(upload, exclude_source_id) is True
 
 
 def lock_source(source_id: str, team_id: int) -> ExternalDataSource | None:
@@ -164,7 +169,9 @@ def release_superseded_uploads(source_id: str, team_id: int, sync_started_at: da
     """Delete the uploads that were superseded before a sync that has now completed started.
 
     That sync read the source's newer file, so the table no longer depends on the older ones. An
-    upload superseded later stays for the sync that reads its replacement.
+    upload superseded later stays for the sync that reads its replacement, and so does the upload the
+    source reads now, in case a replacement pointed it back at an older file. An upload that storage
+    fails to delete stays recorded, so the next completed sync tries again.
     """
     with transaction.atomic():
         source = lock_source(source_id, team_id)
@@ -174,11 +181,34 @@ def release_superseded_uploads(source_id: str, team_id: int, sync_started_at: da
         due = [entry for entry in entries if entry.superseded_at <= sync_started_at]
         if not due:
             return []
+        try:
+            current: UploadLocation | None = upload_from_job_inputs(source.team_id, source.job_inputs)
+        except InvalidUploadError:
+            current = None
         source.connection_metadata = _with_superseded(
             source.connection_metadata, [entry for entry in entries if entry not in due]
         )
         source.save(update_fields=["connection_metadata", "updated_at"])
-    return [entry.upload for entry in due if delete_upload_if_unused(entry.upload, exclude_source_id=source_id)]
+
+    deleted: list[HostedUpload] = []
+    failed: list[SupersededUpload] = []
+    for entry in due:
+        if entry.upload == current:
+            continue
+        result = _delete_if_unused(entry.upload, exclude_source_id=source_id)
+        if result is None:
+            failed.append(entry)
+        elif result:
+            deleted.append(entry.upload)
+    if failed:
+        with transaction.atomic():
+            source = lock_source(source_id, team_id)
+            if source is not None:
+                source.connection_metadata = _with_superseded(
+                    source.connection_metadata, [*superseded_uploads(source), *failed]
+                )
+                source.save(update_fields=["connection_metadata", "updated_at"])
+    return deleted
 
 
 def delete_source_uploads(source: ExternalDataSource) -> list[HostedUpload]:
