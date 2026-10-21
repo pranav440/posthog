@@ -1244,6 +1244,7 @@ def _may_join_thread(
     from products.slack_app.backend.api import post_thread_join_prompt  # noqa: PLC0415
     from products.slack_app.backend.models import SlackThreadJoin, ThreadJoinMode  # noqa: PLC0415
     from products.slack_app.backend.services.slack_settings import resolve_thread_join_mode  # noqa: PLC0415
+    from products.tasks.backend.facade import api as tasks_facade  # noqa: PLC0415
 
     mode = resolve_thread_join_mode(integration, mapping.mentioning_slack_user_id)
     if mode == ThreadJoinMode.ALLOW:
@@ -1262,6 +1263,7 @@ def _may_join_thread(
             owner_slack_user_id=mapping.mentioning_slack_user_id,
             joiner_slack_user_id=slack_user_id,
             opens_thread=mode == ThreadJoinMode.ASK_PER_THREAD,
+            plan_name=plan.plan_name if (plan := tasks_facade.get_run_plan(mapping.task_run.state)) else None,
         )
     logger.info(
         "slack_app_followup_thread_join_held",

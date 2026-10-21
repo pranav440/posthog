@@ -509,14 +509,14 @@ def render_home_view(
         blocks.extend(_auto_model_choice_blocks(auto_model_choice))
     if own_plan is not None:
         blocks.extend(_own_plan_blocks(own_plan))
-    if thread_join_mode is not None:
-        blocks.extend(_thread_join_blocks(thread_join_mode, uses_own_plan=bool(own_plan and own_plan.connected)))
 
     # Section 4 — thread follow-ups: whether replies other people leave in the
-    # threads you started reach PostHog on their own.
+    # threads you started reach PostHog on their own, and who may join those threads.
     if untagged_followup_mode is not None:
         blocks.append({"type": "divider"})
         blocks.extend(_untagged_followups_section_blocks(untagged_followup_mode))
+    if thread_join_mode is not None:
+        blocks.extend(_thread_join_blocks(thread_join_mode, uses_own_plan=bool(own_plan and own_plan.connected)))
 
     # Section 4b — channel questions. `None` means the flag is off for this workspace.
     if untagged_question_mode is not None:
@@ -1073,16 +1073,14 @@ def _thread_join_blocks(mode: ThreadJoinMode, *, uses_own_plan: bool) -> list[di
         "options": options,
         "initial_option": next(o for o in options if o["value"] == mode.value),
     }
-    note = (
-        "Tasks in your threads use your ChatGPT plan, so people who join use your plan too."
-        if uses_own_plan
-        else "When you use your ChatGPT plan, people who join your threads use your plan too."
-    )
-    return [
+    blocks: list[dict] = [
         _subsection_label("People who join your threads"),
         {"type": "actions", "elements": [select]},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": note}]},
     ]
+    if uses_own_plan:
+        note = "Tasks in your threads use your ChatGPT plan, so people who join use your plan too."
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
+    return blocks
 
 
 CHANNEL_WELCOME_MODE_LABELS: dict[str, str] = {
@@ -2288,8 +2286,7 @@ def _build_home_view(
             resolve_auto_model_choice(integration.integration_id, slack_user_id) if home_user is not None else None
         ),
         own_plan=own_plan,
-        # Shown with the plan card, because letting people join is what spends the creator's plan.
-        thread_join_mode=resolve_thread_join_mode(integration, slack_user_id) if own_plan is not None else None,
+        thread_join_mode=resolve_thread_join_mode(integration, slack_user_id),
         has_project_access=bool(accessible),
         # The same settings page the GitHub card deep-links to.
         account_settings_url=github_state.settings_url,

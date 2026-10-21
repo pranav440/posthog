@@ -4181,10 +4181,13 @@ def post_thread_join_prompt(
     owner_slack_user_id: str,
     joiner_slack_user_id: str,
     opens_thread: bool = False,
+    plan_name: str | None = None,
 ) -> bool:
     """Ask the thread creator whether someone else may join their thread.
 
     ``opens_thread`` says that approving lets anyone join the thread, not only this person.
+    ``plan_name`` names the creator's plan when the thread's task runs on it, so the creator
+    knows that people who join spend it.
 
     The whole event is stashed behind a one-off token, so letting them join sends the original
     message rather than a reconstruction of it. The person who asked hears that the creator was
@@ -4250,8 +4253,12 @@ def post_thread_join_prompt(
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "If this task runs on your ChatGPT plan, messages from people who join use your plan too. "
-                        f"In the {home_tab_label} you can choose who joins your threads."
+                        (
+                            f"This task runs on your {plan_name}, so messages from people who join use it too. "
+                            if plan_name
+                            else ""
+                        )
+                        + f"In the {home_tab_label} you can choose who joins your threads."
                     ),
                 }
             ],
