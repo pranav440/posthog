@@ -140,12 +140,19 @@ def is_slack_app_project_picker_enabled(integration: Integration, distinct_id: s
     )
 
 
-def is_slack_app_byos_enabled(integration: Integration, distinct_id: str | None) -> bool:
+def is_slack_app_byos_enabled(integration: Integration, distinct_id: str | None, *, adapter: str = "codex") -> bool:
     """Gate for Slack runs that bill to the user's own plan.
 
-    ``distinct_id`` is the PostHog user whose plan the run would use. The tasks rollout flag
-    for the plan still applies on top of this gate.
+    Depends on the tasks rollout flag for that plan, which is checked first. A Slack run
+    marked for a plan whose rollout is off fails when it starts, so Slack must never mark one.
+    ``distinct_id`` is the PostHog user whose plan the run would use.
     """
+    from products.tasks.backend.facade import api as tasks_facade  # noqa: PLC0415 — keeps tasks off this import path
+
+    if not tasks_facade.own_subscription_cloud_enabled(
+        adapter, distinct_id=distinct_id, organization_id=str(integration.team.organization_id)
+    ):
+        return False
     return _workspace_flag_enabled(
         SLACK_APP_BYOS_FLAG,
         integration,

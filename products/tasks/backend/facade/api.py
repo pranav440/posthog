@@ -102,7 +102,11 @@ from products.tasks.backend.constants import (
 )
 from products.tasks.backend.error_telemetry import truncate_error_message
 from products.tasks.backend.facade.gateway import mint_private_gateway_token, revoke_private_gateway_token
-from products.tasks.backend.feature_flags import get_model_access_error, pi_cloud_runtime_enabled
+from products.tasks.backend.feature_flags import (
+    get_model_access_error,
+    own_subscription_cloud_enabled as _own_subscription_cloud_enabled,
+    pi_cloud_runtime_enabled,
+)
 from products.tasks.backend.github_repository_access import (
     inaccessible_repositories_via_integration as _inaccessible_repositories_via_integration,
 )
@@ -247,7 +251,8 @@ __all__ = [
     "ensure_task_run_session",
     "ensure_subscription_owner",
     "get_run_plan",
-    "unattended_plan_status",
+    "own_subscription_cloud_enabled",
+    "can_bill_plan_unattended",
     "unattended_model_access_state",
     "beacon_task_presence",
     "bootstrap_task_run",
@@ -4084,16 +4089,17 @@ def get_run_plan(state: dict[str, Any] | None) -> contracts.RunPlan | None:
     return contracts.RunPlan(plan_name=SUBSCRIPTION_PLAN_NAMES[access.adapter], owner_user_id=access.owner_id)
 
 
-def unattended_plan_status(
-    user: User, adapter: SubscriptionAdapter, *, organization_id: str
-) -> contracts.UnattendedPlanStatus | None:
-    return unattended_plan.unattended_plan_status(user, adapter, organization_id=organization_id)
+def own_subscription_cloud_enabled(adapter: str, *, distinct_id: str | None, organization_id: str) -> bool:
+    return _own_subscription_cloud_enabled(adapter, distinct_id=distinct_id, organization_id=organization_id)
 
 
-def unattended_model_access_state(user: User, *, organization_id: str, runtime_adapter: str | None) -> dict[str, str]:
-    return unattended_plan.unattended_model_access_state(
-        user, organization_id=organization_id, runtime_adapter=runtime_adapter
-    )
+def can_bill_plan_unattended(user: User, adapter: SubscriptionAdapter) -> bool:
+    return unattended_plan.can_bill_plan_unattended(user, adapter)
+
+
+def unattended_model_access_state(user: User, *, runtime_adapter: str | None) -> dict[str, str]:
+    """See `unattended_plan`: the caller checks the plan's rollout flag first."""
+    return unattended_plan.unattended_model_access_state(user, runtime_adapter=runtime_adapter)
 
 
 def ensure_subscription_owner(state: dict[str, Any] | None, actor_user_id: int | None) -> None:

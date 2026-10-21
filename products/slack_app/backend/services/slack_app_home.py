@@ -2547,16 +2547,11 @@ def _resolve_own_plan_state(
         return None
     try:
         target = _routed_project_integration(integration, slack_user_id, accessible=accessible)
-        if target is None or not is_slack_app_byos_enabled(integration, home_user.distinct_id):
-            return None
-        status = tasks_facade.unattended_plan_status(
-            home_user, "codex", organization_id=str(target.team.organization_id)
-        )
-        if status is None:
+        if target is None or not is_slack_app_byos_enabled(target, home_user.distinct_id):
             return None
         site_url = (settings.SITE_URL or "").rstrip("/")
         return OwnPlanState(
-            connected=status.connected,
+            connected=tasks_facade.can_bill_plan_unattended(home_user, "codex"),
             settings_url=(
                 f"{site_url}/project/{target.team_id}/settings/environment-ai-subscriptions" if site_url else None
             ),

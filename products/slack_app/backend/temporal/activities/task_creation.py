@@ -69,18 +69,16 @@ def _slack_actor_state_updates(*, user_id: int, slack_user_id: str) -> dict[str,
 def _own_plan_state(integration: Any, user: Any, *, runtime_adapter: str | None) -> dict[str, Any]:
     """The run-state keys that bill a new run to this user's own plan, or none to keep PostHog credits.
 
-    The user who starts the run owns the plan, so a reply from someone else never spends it.
+    The caller passes the thread creator, whose plan pays for every turn in the thread.
     A failed check keeps the run on credits rather than blocking the mention.
     """
     from products.slack_app.backend.feature_flags import is_slack_app_byos_enabled  # noqa: PLC0415
     from products.tasks.backend.facade import api as tasks_facade  # noqa: PLC0415
 
     try:
-        state: dict[str, Any] = tasks_facade.unattended_model_access_state(
-            user, organization_id=str(integration.team.organization_id), runtime_adapter=runtime_adapter
-        )
+        state: dict[str, Any] = tasks_facade.unattended_model_access_state(user, runtime_adapter=runtime_adapter)
         # Checked last: most mentions stop at the local plan checks and send no flag request.
-        if state and is_slack_app_byos_enabled(integration, user.distinct_id):
+        if state and is_slack_app_byos_enabled(integration, user.distinct_id, adapter=str(runtime_adapter)):
             return state
     except Exception:
         logger.exception("slack_app_own_plan_resolution_failed", user_id=user.id)
