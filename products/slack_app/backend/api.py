@@ -4344,9 +4344,9 @@ def _handle_thread_join_allow(payload: dict) -> HttpResponse:
         return HttpResponse(status=200)
     # The unique constraint makes a double click or a retry a no-op.
     SlackThreadJoin.objects.for_team(mapping.team_id).get_or_create(
-        mapping=mapping,
+        thread_mapping=mapping,
         slack_user_id=joiner_slack_user_id,
-        defaults={"team_id": mapping.team_id, "allowed_by_slack_user_id": context["owner_slack_user_id"]},
+        defaults={"team_id": mapping.team_id},
     )
 
     cache.delete(_picker_context_cache_key(context_token))

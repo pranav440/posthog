@@ -78,23 +78,23 @@ class SlackThreadTaskMapping(UUIDModel):
 
 
 class SlackThreadJoin(TeamScopedRootMixin, UUIDModel):
-    """A person the thread creator let join their thread under the ``ask`` join mode.
+    """A person the thread creator let join their thread under an ask join mode.
 
-    Joining lets the person send messages to the thread's task, which can spend the creator's
-    own plan, so the row records who allowed it and when.
+    Only the thread creator can approve, so the approver is the mapping's
+    ``mentioning_slack_user_id``. Joining can spend the creator's own plan, so the row keeps when
+    the approval happened.
     """
 
     # db_constraint=False: a foreign key constraint to posthog_team locks that hot table when the
     # table is created. The mapping cascade removes these rows when a team goes.
     team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+", db_constraint=False)
-    mapping = models.ForeignKey(SlackThreadTaskMapping, on_delete=models.CASCADE, related_name="joins")
+    thread_mapping = models.ForeignKey(SlackThreadTaskMapping, on_delete=models.CASCADE, related_name="joins")
     slack_user_id = models.CharField(max_length=64)
-    allowed_by_slack_user_id = models.CharField(max_length=64)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["mapping", "slack_user_id"], name="uniq_slack_thread_join"),
+            models.UniqueConstraint(fields=["thread_mapping", "slack_user_id"], name="uniq_slack_thread_join"),
         ]
 
 

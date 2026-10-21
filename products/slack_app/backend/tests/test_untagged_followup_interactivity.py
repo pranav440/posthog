@@ -297,12 +297,12 @@ class TestUntaggedFollowupInteractivity(TestCase):
             response = self._click(THREAD_JOIN_ACTION_ALLOW, clicker)
 
         assert response.status_code == 200
-        joins_recorded = list(
+        joined = list(
             SlackThreadJoin.objects.for_team(self.team.id)
-            .filter(mapping=self.mapping)
-            .values_list("slack_user_id", "allowed_by_slack_user_id")
+            .filter(thread_mapping=self.mapping)
+            .values_list("slack_user_id", flat=True)
         )
-        assert joins_recorded == ([("U_BOB", "U_ALICE")] if joins else [])
+        assert joined == (["U_BOB"] if joins else [])
         assert mock_start.called is joins
         if joins:
             assert mock_start.call_args.args[0] == self.event

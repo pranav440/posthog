@@ -1196,7 +1196,7 @@ class TestForwardPostHogCodeFollowupActivity(TestCase):
         mapping = self._create_mapping(mentioning_user="U_ALICE")
         for slack_user_id in joined or []:
             SlackThreadJoin.objects.for_team(self.team.id).create(
-                team=self.team, mapping=mapping, slack_user_id=slack_user_id, allowed_by_slack_user_id="U_ALICE"
+                team=self.team, thread_mapping=mapping, slack_user_id=slack_user_id
             )
         bob = User.objects.create(email="bob@test.com", first_name="Bob")
         mock_slack_cls.return_value = MagicMock()

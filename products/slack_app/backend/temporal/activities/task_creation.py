@@ -1237,7 +1237,7 @@ def _may_join_thread(
     mode = resolve_thread_join_mode(integration, mapping.mentioning_slack_user_id)
     if mode == ThreadJoinMode.ALLOW:
         return True
-    approvals = SlackThreadJoin.objects.for_team(mapping.team_id).filter(mapping_id=mapping.id)
+    approvals = SlackThreadJoin.objects.for_team(mapping.team_id).filter(thread_mapping_id=mapping.id)
     # A person's approval holds whatever the mode is now: a mode change applies to new people only.
     if approvals.filter(slack_user_id=slack_user_id).exists():
         return True
