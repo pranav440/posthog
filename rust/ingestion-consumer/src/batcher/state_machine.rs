@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use common_kafka_consumer::{GroupCompletion, Offset, Partition};
 use metrics::{counter, gauge, histogram};
 
+use super::governor::{Adaptation, Governor, GovernorSettings, GovernorSnapshot};
 use super::in_flight::{InFlightRequest, InFlightRequests, RequestId, SentMessage};
 use super::key_queues::{KeyQueues, KeyRun, Settlement};
 use super::packer::Packer;
@@ -93,6 +94,7 @@ pub struct BatcherSnapshot {
     pub in_flight_requests: usize,
     pub in_flight_messages: usize,
     pub per_worker: Vec<WorkerInFlight>,
+    pub governor: GovernorSnapshot,
 }
 
 pub enum BatcherStateMachine {
@@ -126,6 +128,10 @@ impl BatcherStateMachine {
         if targets.events.is_none() && targets.bytes.is_none() {
             return Err("set a pack target in events or bytes".to_string());
         }
+        let governor = Governor::new(
+            GovernorSettings::observing(),
+            assigner.max_requests_per_worker(),
+        )?;
         Ok(BatcherStateMachine::Running(ActiveState {
             keys: KeyQueues::new(packer.run_cap()),
             packer,
@@ -135,6 +141,7 @@ impl BatcherStateMachine {
             stall_timeout,
             last_progress: now,
             soft_budget: None,
+            governor,
         }))
     }
 
@@ -149,6 +156,19 @@ impl BatcherStateMachine {
                 ..active
             }),
             other => other,
+        }
+    }
+
+    pub fn with_governor(self, settings: GovernorSettings) -> Result<Self, String> {
+        match self {
+            BatcherStateMachine::Running(active) => {
+                let governor = Governor::new(settings, active.assigner.max_requests_per_worker())?;
+                Ok(BatcherStateMachine::Running(ActiveState {
+                    governor,
+                    ..active
+                }))
+            }
+            other => Ok(other),
         }
     }
 
@@ -323,6 +343,7 @@ pub struct ActiveState {
     stall_timeout: Duration,
     last_progress: Instant,
     soft_budget: Option<Duration>,
+    governor: Governor,
 }
 
 impl ActiveState {
@@ -340,6 +361,7 @@ impl ActiveState {
             in_flight_requests: self.in_flight.len(),
             in_flight_messages: self.assigner.in_flight_messages(),
             per_worker: self.assigner.in_flight_per_worker(),
+            governor: self.governor.snapshot(),
         }
     }
 
@@ -382,6 +404,7 @@ impl ActiveState {
     ) -> Result<Effects, String> {
         let mut effects = Effects::default();
         let sent = self.take_request(request, &mut effects)?;
+        self.observe_rtt(sent.sent_at, now);
         if accepted as usize != sent.message_count {
             return Err(format!(
                 "worker accepted {accepted} of {} messages",
@@ -425,6 +448,7 @@ impl ActiveState {
     ) -> Result<Effects, String> {
         let mut effects = Effects::default();
         let sent = self.take_request(request, &mut effects)?;
+        self.observe_rtt(sent.sent_at, now);
         effects.worker_outcomes.push(WorkerOutcome {
             worker: sent.worker.clone(),
             fault: false,
@@ -523,10 +547,25 @@ impl ActiveState {
             .in_flight
             .take(request)
             .ok_or_else(|| format!("response for unknown request {request:?}"))?;
+        self.governor.release();
         if self.assigner.release(&sent.worker, sent.message_count) {
             effects.idle_workers.push(sent.worker.clone());
         }
         Ok(sent)
+    }
+
+    /// Only an accepted or partial settlement is a sample: a fault or a busy
+    /// answer measures the failure, not the worker.
+    fn observe_rtt(&mut self, sent_at: Instant, now: Instant) {
+        let rtt = now.saturating_duration_since(sent_at);
+        if let Some(decision) = self.governor.observe(rtt, now) {
+            counter!(
+                "ingestion_consumer_governor_adjustments_total",
+                "direction" => decision.direction.as_str(),
+                "applied" => if decision.applied { "true" } else { "false" }
+            )
+            .increment(1);
+        }
     }
 
     fn settle_key(
@@ -557,6 +596,7 @@ impl ActiveState {
         effects: &mut Effects,
     ) -> Result<(), String> {
         self.restart_stall_clock_if_quiet(now);
+        self.governor.set_pool(workers.len());
         // Past the stall deadline no new request starts, so overlapping
         // failures drain to nothing in flight and the watchdog can fire.
         let stalled = self.pending_messages() > 0 && now >= self.last_progress + self.stall_timeout;
@@ -574,7 +614,11 @@ impl ActiveState {
         effects: &mut Effects,
     ) -> Result<(), String> {
         let free_slots = self.assigner.free_slots(workers);
-        let batch = self.packer.pack(&mut self.keys, now, free_slots, draining);
+        let free = match self.governor.adaptation() {
+            Adaptation::On => free_slots.min(self.governor.free()),
+            Adaptation::Off => free_slots,
+        };
+        let batch = self.packer.pack(&mut self.keys, now, free, draining);
         for request in batch {
             let worker = self
                 .assigner
@@ -583,12 +627,25 @@ impl ActiveState {
             if self.assigner.requests_on(&worker) == 1 {
                 effects.busy_workers.push(worker.clone());
             }
-            self.send(now, worker, request, effects);
+            self.send(now, worker, request, effects)?;
+        }
+        if self.keys.has_ready() && self.governor.free() == 0 {
+            self.governor.starve();
+            counter!("ingestion_consumer_governor_starved_passes_total").increment(1);
         }
         Ok(())
     }
 
-    fn send(&mut self, now: Instant, worker: WorkerId, request: Request, effects: &mut Effects) {
+    fn send(
+        &mut self,
+        now: Instant,
+        worker: WorkerId,
+        request: Request,
+        effects: &mut Effects,
+    ) -> Result<(), String> {
+        if !self.governor.take() {
+            return Err("a request was sent without a free permit".to_string());
+        }
         let kind = if request.class.replay {
             "replay"
         } else {
@@ -602,7 +659,7 @@ impl ActiveState {
         );
         let id = self
             .in_flight
-            .register(worker.clone(), request.class, &request.runs);
+            .register(worker.clone(), request.class, now, &request.runs);
         effects.sends.push(SendRequest {
             request: id,
             worker,
@@ -610,6 +667,7 @@ impl ActiveState {
             soft_budget: self.soft_budget.filter(|_| !request.class.unbudgeted),
             runs: request.runs,
         });
+        Ok(())
     }
 
     fn finish(&mut self, now: Instant, effects: &mut Effects) -> Result<(), String> {
@@ -649,6 +707,13 @@ impl ActiveState {
         gauge!("ingestion_consumer_batcher_claimed_keys").set(self.keys.claimed_keys() as f64);
         gauge!("ingestion_consumer_batcher_waiting_keys").set(self.keys.waiting_keys() as f64);
         gauge!("ingestion_consumer_batcher_in_flight_requests").set(self.in_flight.len() as f64);
+        let governor = self.governor.snapshot();
+        gauge!("ingestion_consumer_governor_permits").set(governor.permits as f64);
+        gauge!("ingestion_consumer_governor_ceiling").set(governor.ceiling as f64);
+        gauge!("ingestion_consumer_governor_free_permits").set(governor.free_permits as f64);
+        if let Some(rtt) = governor.rtt {
+            gauge!("ingestion_consumer_request_rtt_seconds").set(rtt.as_secs_f64());
+        }
     }
 }
 
@@ -726,6 +791,8 @@ mod tests {
     const NO_WORKER_DELAY: Duration = Duration::from_millis(100);
     const STALL: Duration = Duration::from_secs(60);
     const BUDGET: Duration = Duration::from_millis(250);
+    const LATENCY_BUDGET: Duration = Duration::from_secs(1);
+    const SLOW_RTT: Duration = Duration::from_secs(2);
 
     /// Distinct delays, so a wakeup time shows which retry reason applied.
     fn retry_policy() -> RetryPolicy {
@@ -769,6 +836,18 @@ mod tests {
             soft_budget: BUDGET,
             attempts: NonZeroU32::new(attempts).expect("nonzero attempts"),
         }))
+    }
+
+    /// One worker with four slots, and a latency budget the slow settlements
+    /// of these tests exceed.
+    fn governed_batcher(adaptation: Adaptation, now: Instant) -> BatcherStateMachine {
+        batcher(4, now)
+            .with_governor(GovernorSettings {
+                adaptation,
+                latency_budget: Some(LATENCY_BUDGET),
+                ..GovernorSettings::observing()
+            })
+            .expect("valid governor settings")
     }
 
     fn pool(workers: &[&str]) -> Vec<WorkerId> {
@@ -821,6 +900,97 @@ mod tests {
             .iter()
             .flat_map(|run| run.messages.iter().cloned())
             .collect()
+    }
+
+    /// Four keys fill the worker's slots, one settles past the latency
+    /// budget, and a fifth key arrives. Returns every action's effects.
+    fn saturate_then_settle_slowly(
+        batcher: BatcherStateMachine,
+        now: Instant,
+    ) -> (BatcherStateMachine, Vec<String>) {
+        let workers = pool(&["w"]);
+        let runs = vec![
+            run("a", &[1]),
+            run("b", &[2]),
+            run("c", &[3]),
+            run("d", &[4]),
+        ];
+        let (batcher, effects) = batcher.on_groups(now, &workers, 0, runs);
+        let first = effects.sends[0].request;
+        let mut log = vec![format!("{effects:?}")];
+        let settled_at = now + SLOW_RTT;
+        let (batcher, effects) = batcher.on_request_succeeded(settled_at, &workers, first, 1);
+        log.push(format!("{effects:?}"));
+        let (batcher, effects) = batcher.on_groups(settled_at, &workers, 0, vec![run("e", &[5])]);
+        log.push(format!("{effects:?}"));
+        (batcher, log)
+    }
+
+    #[test]
+    fn with_adaptation_off_the_governor_changes_no_effect_while_its_shadow_pool_moves() {
+        let now = Instant::now();
+        let (unbudgeted, unbudgeted_log) = saturate_then_settle_slowly(batcher(4, now), now);
+        let (shadow, shadow_log) =
+            saturate_then_settle_slowly(governed_batcher(Adaptation::Off, now), now);
+        assert_eq!(unbudgeted_log, shadow_log);
+
+        assert_eq!(unbudgeted.snapshot().governor.permits, 4);
+        let governor = shadow.snapshot().governor;
+        assert_eq!(governor.rtt, Some(SLOW_RTT));
+        assert_eq!(
+            (governor.permits, governor.ceiling),
+            (3, 4),
+            "the shadow pool shrank below the ceiling"
+        );
+    }
+
+    #[test]
+    fn with_adaptation_on_free_permits_cap_the_pass_until_a_permit_returns() {
+        let now = Instant::now();
+        let workers = pool(&["w"]);
+        let runs = vec![
+            run("a", &[1]),
+            run("b", &[2]),
+            run("c", &[3]),
+            run("d", &[4]),
+        ];
+        let (batcher, effects) =
+            governed_batcher(Adaptation::On, now).on_groups(now, &workers, 0, runs);
+        assert_eq!(effects.sends.len(), 4);
+        let (a, b) = (effects.sends[0].request, effects.sends[1].request);
+
+        let settled_at = now + SLOW_RTT;
+        let (batcher, _) = batcher.on_request_succeeded(settled_at, &workers, a, 1);
+        let (batcher, effects) = batcher.on_groups(settled_at, &workers, 0, vec![run("e", &[5])]);
+        assert!(
+            effects.sends.is_empty(),
+            "a's slot is free but the pool shrank to three"
+        );
+        let governor = batcher.snapshot().governor;
+        assert_eq!((governor.permits, governor.free_permits), (3, 0));
+
+        let (_, effects) = batcher.on_request_succeeded(settled_at, &workers, b, 1);
+        assert_eq!(shape(&effects.sends[0]), vec![("e", vec![5])]);
+    }
+
+    #[test]
+    fn a_failed_request_returns_its_permit_without_an_rtt_sample() {
+        let now = Instant::now();
+        let workers = pool(&["w"]);
+        let (batcher, effects) = batcher(4, now).on_groups(now, &workers, 0, vec![run("a", &[1])]);
+        let request = effects.sends[0].request;
+        assert_eq!(batcher.snapshot().governor.free_permits, 3);
+
+        let (batcher, _) = batcher.on_request_failed(
+            now + SLOW_RTT,
+            &workers,
+            request,
+            FailureCause::Busy,
+            vec![message("a", 0, 1)],
+        );
+        let governor = batcher.snapshot().governor;
+        assert_eq!(governor.free_permits, 4);
+        assert_eq!(governor.rtt, None, "a busy answer is no round-trip sample");
     }
 
     #[test]

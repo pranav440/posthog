@@ -57,6 +57,7 @@ The batcher state machine in `src/batcher/` orders runs and places them on worke
 - Each key has a FIFO queue, and at most one request per key is in flight, which preserves per-key order.
 - The packer builds a request only for a free worker slot, from ready keys up to a target size. Keys stay unclaimed until then, so a key's run keeps growing while every slot is busy, up to the run cap. A key's backlog past the run cap leaves in consecutive requests, one in flight at a time. The run cap is the target unless `INGESTION_RUN_CAP_*` sets it apart. A request never mixes assignment epochs or fresh and replayed messages.
 - A request is placed on a worker when it is sent, against the load at that moment. Each worker takes at most `INGESTION_WORKER_CONCURRENT_BATCHES` requests at a time.
+- A governor holds a permit pool between `INGESTION_GOVERNOR_MIN_PERMITS_PER_WORKER` and `INGESTION_WORKER_CONCURRENT_BATCHES` permits per routable worker, so at the ceiling the permits are the worker slots. A round-trip average over `INGESTION_GOVERNOR_LATENCY_BUDGET_MS` shrinks the pool by one, and a starved pass, ready work with no free permit, grows it by one once the average is within budget, at most once per `INGESTION_GOVERNOR_STEP_INTERVAL_MS`. Only accepted and partial acks feed the average. With `INGESTION_GOVERNOR_ADAPTATION=off` the pool is a shadow that reports what it would do while free slots size each pass.
 - A failed send returns its messages to the front of their keys' queues. They retry through the packer as replay after the retry delay.
 - A partial ack completes the messages the worker finished. Its unfinished messages return to the front of their keys' queues and go out again at once as replay. They need not be the last messages of their key.
 - A key resends without a budget once `INGESTION_REQUEST_BUDGET_ATTEMPTS` settles have left its messages unfinished since it last finished a run, or at once when its request finished nothing, because a budgeted retry would wait out the same budget again. So a message that never fits the budget still finishes. A failed request neither counts nor resets the count. The resend rides in a request that holds only such keys, ahead of budgeted replays.
@@ -73,6 +74,10 @@ The batcher state machine in `src/batcher/` orders runs and places them on worke
 | `INGESTION_REQUEST_SOFT_BUDGET_MS` | `0` | How long a worker may spend on one request before it stops starting work and acks what finished as partial. The rest goes out again at once. `0` sends no budget. A request split into several frames goes without one. Startup fails if it is below `100` or above `2147483647`, if it times `INGESTION_WORKER_CONCURRENT_BATCHES` reaches `INGESTION_WORKER_STREAM_ACK_TIMEOUT_MS`, or if it plus `INGESTION_PACK_LATENCY_BUDGET_MS` reaches `CONSUMER_DEFERRED_FLUSH_TIMEOUT_MS`. |
 | `INGESTION_REQUEST_BUDGET_ATTEMPTS` | `3` | How many budgeted attempts may leave a key's messages unfinished, since the key last finished a run, before it resends without a budget. At least 1, or startup fails. Only read when `INGESTION_REQUEST_SOFT_BUDGET_MS` is set. |
 | `INGESTION_PARKED_RETRY_INTERVAL_MS` | `200` | The delay before a failed send retries, and how often a request with no routable worker tries again. |
+| `INGESTION_GOVERNOR_ADAPTATION` | `off` | `off` keeps the governor observing: it measures request round-trip time and reports the permit pool it would run, while free worker slots size each pass. `on` sizes the pass by free permits too. |
+| `INGESTION_GOVERNOR_LATENCY_BUDGET_MS` | `0` | A round-trip average above this shrinks the permit pool by one per step. `0` never shrinks. Startup fails when adaptation is on without it, when it reaches `INGESTION_REQUEST_SOFT_BUDGET_MS`, because a partial ack caps the round trip there, or when it reaches `INGESTION_WORKER_STREAM_ACK_TIMEOUT_MS`. |
+| `INGESTION_GOVERNOR_MIN_PERMITS_PER_WORKER` | `1` | The permit pool never shrinks below this many permits per routable worker. Startup fails below `1` or above `INGESTION_WORKER_CONCURRENT_BATCHES`. |
+| `INGESTION_GOVERNOR_STEP_INTERVAL_MS` | `1000` | The least time between two permit steps. Startup fails below `100`. |
 
 Metrics:
 
@@ -83,6 +88,10 @@ Metrics:
 - `ingestion_consumer_request_budget_partials_total` counts partial acks, and `ingestion_consumer_request_budget_unfinished_messages_total` counts the messages they left unfinished.
 - `ingestion_consumer_request_budget_escalations_total` counts keys that resend without a budget, after their budgeted attempts or after a partial ack that finished nothing. A steady rate means the budget is too tight for the lane, or that the workers are saturated: a frame that waits out its budget for a pipeline slot comes back as a partial ack with nothing finished, and the worker counts it in `ingestion_api_grpc_admission_expired_total`.
 - The `ingestion_consumer_batcher_*` gauges report keys, queued messages and bytes, claimed and waiting keys, unplaced work, and in-flight requests.
+- `ingestion_consumer_governor_permits`, `ingestion_consumer_governor_ceiling` and `ingestion_consumer_governor_free_permits` report the permit pool, its ceiling, which is every worker slot, and the permits no request holds. With adaptation off the pool is the shadow pool.
+- `ingestion_consumer_request_rtt_seconds` is the round-trip average the governor steps on.
+- `ingestion_consumer_governor_adjustments_total{direction=grow|shrink,applied=true|false}` counts the governor's steps. `applied=false` means the step changed nothing on the send path: adaptation is off, or the pool is at a bound.
+- `ingestion_consumer_governor_starved_passes_total` counts passes that left ready work waiting with no free permit, which is demand the worker pool cannot take.
 
 ## Debug API
 

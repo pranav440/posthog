@@ -201,6 +201,19 @@ pub struct BatcherLoad {
     pub waiting_keys: usize,
     /// Keys with a request in flight.
     pub claimed_keys: usize,
+    pub governor: GovernorLoad,
+}
+
+/// The governor's permit pool, as the batcher task reports it.
+#[derive(Serialize)]
+pub struct GovernorLoad {
+    /// `on` or `off`; off means the pool is a shadow.
+    pub adaptation: &'static str,
+    pub permits: usize,
+    pub ceiling: usize,
+    pub free_permits: usize,
+    /// The round-trip average; `None` before the first sample.
+    pub rtt_seconds: Option<f64>,
 }
 
 /// The consumer's routing configuration and, under aperture, its current

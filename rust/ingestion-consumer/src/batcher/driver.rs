@@ -973,6 +973,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_rtt_sample_is_the_time_between_dispatch_and_settlement() {
+        let h = Harness::new(&["w"], 4);
+        let snapshots = h.driver.snapshot_sender();
+        h.submit(vec![run("a", &[1])]);
+        settle().await;
+        let send = h.take_sent().pop().unwrap();
+
+        let rtt = Duration::from_millis(750);
+        tokio::time::advance(rtt).await;
+        send.reply.send(Ok(SendOutcome::Accepted(1))).unwrap();
+        settle().await;
+        let snapshot = snapshots.snapshot().await.expect("the task answers");
+        assert_eq!(snapshot.governor.rtt, Some(rtt));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn request_events_follow_a_failed_send_and_its_replay() {
         let (h, recorder) = Harness::recorded(&["w"], 4);
         h.submit(vec![run("a", &[1])]);
