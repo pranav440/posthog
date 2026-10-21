@@ -477,7 +477,7 @@ class TestRenderHomeView:
             untagged_question_mode=UntaggedFollowupMode.ASK,
             channel_welcome_mode=ChannelWelcomeMode.CHANNEL,
             auto_model_choice=auto_model_choice,
-            own_plan=OwnPlanState(team_id=1, user_id=1, connected=True, enabled=auto_model_choice),
+            own_plan=OwnPlanState(connected=True),
         )
 
     def test_every_control_the_tab_renders_is_routable(self):
